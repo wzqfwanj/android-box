@@ -3,7 +3,9 @@
 
 用法: python cp_ticket.py <instance-id>
 输出: JSON {ticket, appInstanceId, appInstanceGroupId, persistentAppInstanceId, port}
-凭据从 ~/.aliyun/config.json 读取（不把 AK 写进仓库）。
+
+凭据来源：环境变量 ALIYUN_CONFIG（默认 ~/.aliyun/config.json）指向的 aliyun CLI 配置
+（取第一个 profile 的 AK/SK），不把密钥写进仓库。
 """
 import base64
 import hashlib
@@ -25,19 +27,31 @@ def _percent(value):
     return urllib.parse.quote(str(value), safe="~")
 
 
+def _load_credentials():
+    path = os.path.expanduser(os.environ.get("ALIYUN_CONFIG", "~/.aliyun/config.json"))
+    if not os.path.exists(path):
+        return None, "缺少阿里云凭据文件：%s" % path
+    try:
+        cfg = json.load(open(path, encoding="utf-8"))
+        profile = cfg["profiles"][0]
+        return (profile["access_key_id"], profile["access_key_secret"]), ""
+    except Exception as exc:  # noqa: BLE001
+        return None, "阿里云凭据格式错误：%s" % exc
+
+
 def _sign(params, secret):
     canonical = "&".join("%s=%s" % (_percent(k), _percent(params[k])) for k in sorted(params))
     string_to_sign = "POST&%2F&" + _percent(canonical)
-    digest = hmac.new((secret + "&").encode("utf-8"), string_to_sign.encode("utf-8"), hashlib.sha1).digest()
+    digest = hmac.new((secret + "&").encode("utf-8"),
+                      string_to_sign.encode("utf-8"), hashlib.sha1).digest()
     return canonical + "&Signature=" + _percent(base64.b64encode(digest).decode("utf-8"))
 
 
 def get_ticket(instance):
-    cfg_path = os.path.expanduser("~/.aliyun/config.json")
-    if not os.path.exists(cfg_path):
-        return {"error": "缺少 ~/.aliyun/config.json"}
-    profile = json.load(open(cfg_path, encoding="utf-8"))["profiles"][0]
-    ak, secret = profile["access_key_id"], profile["access_key_secret"]
+    creds, err = _load_credentials()
+    if creds is None:
+        return {"error": err}
+    ak, secret = creds
     params = {
         "AccessKeyId": ak,
         "Action": "BatchGetAcpConnectionTicket",
@@ -58,10 +72,7 @@ def get_ticket(instance):
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")[:400]
-        # 常见错误友好提示
-        hint = ""
-        if "Forbidden" in detail:
-            hint = "（RAM 用户缺少 eds-aic 权限）"
+        hint = "（RAM 用户缺少 eds-aic 权限）" if "Forbidden" in detail else ""
         return {"error": "HTTP %s%s: %s" % (exc.code, hint, detail)}
     except Exception as exc:  # noqa: BLE001
         return {"error": "%s: %s" % (type(exc).__name__, exc)}

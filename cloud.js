@@ -1,5 +1,5 @@
 ﻿/* ============================================================
-   安卓系统 · ARM 云手机 — 通过阿里云无影 Web SDK 串流
+   android-box · 在线真机 — 通过阿里云无影 Web SDK 串流
    ------------------------------------------------------------
    后端 /api/cp/ticket 返回连接凭证（Ticket + appInstanceId），
    前端用官方 SDK 在页面内嵌 iframe 里渲染云手机画面，
@@ -55,7 +55,7 @@
     }
     setStatus("获取连接凭证…");
     setBootNote("获取连接凭证 — 云端串流");
-    api("../api/cp/ticket")
+    api("api/cp/ticket")
       .then(function (data) {
         if (!data.ok || !data.ticket) {
           setStatus("云手机暂不可用：" + (data.error || "没有 Ticket"));

@@ -1,81 +1,17 @@
-# android-box.service —— 在线真安卓 Web 服务（Python 3 标准库，端口 8150）
-#
-# 作用：把 redroid 容器的画面转成 MJPEG、把浏览器点按/滑动/按键注入真实 Android、
-#       接收 APK 上传安装。只调用 adb / ffmpeg，不直接操作 Docker。
-#
-# 安装步骤（应用机 dev，180.76.180.249，root；完整上下文见 deploy/DEPLOY.md）：
-#   1) 一次性准备（见 DEPLOY.md 第 3、4 节）：
-#        useradd --system --home-dir /opt/android-box --shell /usr/sbin/nologin --no-create-home androidbox
-#        install -d -o androidbox -g androidbox -m 0755 /opt/android-box
-#        install -d -o androidbox -g androidbox -m 0750 /var/lib/android-box /var/lib/android-box/tmp
-#        /etc/android-box.env（root:root 0600，内容见 DEPLOY.md 第 4 节）
-#   2) 安装本单元（代码由 deploy/deploy.sh 同步，unit 先 scp 上去）：
-#        scp deploy/android-box.service dev:/etc/systemd/system/android-box.service
-#        ssh dev 'chmod 0644 /etc/systemd/system/android-box.service; systemctl daemon-reload; systemctl enable android-box'
-#   3) 首次发布：在本地仓库根目录执行 bash deploy/deploy.sh（同步代码并重启服务）
-#   4) 自检：
-#        curl -s http://127.0.0.1:8150/api/health
-#        curl -s http://127.0.0.1:8150/api/state     # 期望 adb_online=true、booted=true
-#
-# 关键设计（为什么这样配）：
-#   - 运行用户 androidbox 没有任何 docker 权限：容器由 root 的 redroid.service 管理，
-#     本服务只需要 adb/ffmpeg 两个外部命令（见 README 技术栈）。
-#   - HOME=/var/lib/android-box：adb 需要 HOME 保存 ~/.android（adb_keys、server 标记等）。
-#     StateDirectory=android-box 由 systemd 创建并授权给 androidbox，重启后保留，因此 adb 授权稳定。
-#   - TMPDIR=/var/lib/android-box/tmp：APK 上传（上限 500 MB）写入磁盘而不是 tmpfs。
-#     PrivateTmp=true 时 /tmp 是内存盘，500 MB 上传会挤占内存；改道后上传落盘。
-#     adb/ffmpeg 是 Python 的子进程，继承同一 TMPDIR 与挂载命名空间，路径互通，无跨命名空间问题。
-#   - PrivateTmp=true 仍保留：只有本服务的 /tmp 被隔离；上传临时文件因 TMPDIR 改道不会进 tmpfs。
-#     /var/lib/android-box 通过 StateDirectory 隐式可写，满足 ProtectSystem=strict。
-#   - PrivateDevices=true 会隐藏 USB 设备节点：本服务只用 TCP adb（连 127.0.0.1:5555 的 redroid），
-#     不需要 USB。若 journal 里出现 adb 无法初始化 USB 的告警可忽略；确实影响启动时再删掉这一行。
-#   - adb server（TCP 5037）与 ffmpeg 都是本服务的子进程；systemctl stop/restart 时随 cgroup 一并清理，
-#     不会残留独占 5037 的旧 server；重启后 app.py 的 adb watchdog 每 10s 重新 adb connect，自动恢复。
-#   - 不硬依赖 redroid：容器没起时页面仍可打开（显示等待 adb 的状态），容器恢复后自动重连。
-#   - 若手工以 root 跑过 adb connect：首次启动本服务前执行 `adb kill-server`，
-#     避免 root 的 adb server 与 androidbox 的服务混用（见 DEPLOY.md 第 5 节）。
-
-[Unit]
-Description=android-box - 在线真安卓 Web 服务（Python 标准库，8150）
-Documentation=https://github.com/wzqfwanj/android-box/blob/main/deploy/DEPLOY.md
-After=network-online.target redroid.service
+﻿[Unit]
+Description=android-box (ARM cloud phone web bridge)
+Documentation=https://github.com/wzqfwanj/android-box
+After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=androidbox
-Group=androidbox
 WorkingDirectory=/opt/android-box
-EnvironmentFile=/etc/android-box.env
+EnvironmentFile=-/etc/android-box/cloud.env
 Environment=PYTHONUNBUFFERED=1
-Environment=PYTHONDONTWRITEBYTECODE=1
-Environment=HOME=/var/lib/android-box
-Environment=TMPDIR=/var/lib/android-box/tmp
-Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-
-StateDirectory=android-box
-StateDirectoryMode=0750
-ExecStartPre=-/bin/mkdir -p /var/lib/android-box/tmp
 ExecStart=/usr/bin/python3 /opt/android-box/app.py
-
 Restart=always
-RestartSec=3
-UMask=0077
-
-# 基础加固：文件系统只读，仅 StateDirectory 可写；不授予任何 capability
-NoNewPrivileges=true
-CapabilityBoundingSet=
-PrivateTmp=true
-PrivateDevices=true
-ProtectSystem=strict
-ProtectHome=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-RestrictSUIDSGID=true
-LockPersonality=true
-RestrictNamespaces=true
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestartSec=2
 
 [Install]
 WantedBy=multi-user.target

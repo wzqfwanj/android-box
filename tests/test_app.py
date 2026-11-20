@@ -1,136 +1,123 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""黑盒测试：不依赖真实 adb/ffmpeg，只验证 HTTP 层与接口校验。
-
-运行：python -m unittest discover -s tests -v
-"""
-
+"""android-box 单元测试（标准库 unittest，不依赖真实云手机/阿里云）。"""
 import json
 import os
+import sys
 import threading
 import unittest
 import urllib.error
 import urllib.request
-from http.server import ThreadingHTTPServer
 
-# 让 adb/ffmpeg 指向不存在的命令：接口应优雅降级而不是抛异常
-os.environ["ADB_BIN"] = "adb-not-installed"
-os.environ["FFMPEG_BIN"] = "ffmpeg-not-installed"
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, BASE)
 
-import app  # noqa: E402  (import 顺序是刻意的)
+os.environ.pop("CLOUD_PHONE_INSTANCE", None)
+os.environ["ALIYUN_CONFIG"] = os.path.join(BASE, "tests", "no-such-aliyun-config.json")
 
-
-def request(method, url, payload=None, raw=None):
-    data = None
-    headers = {}
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    elif raw is not None:
-        data = raw
-        headers["Content-Type"] = "application/octet-stream"
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status, dict(resp.headers), resp.read()
-    except urllib.error.HTTPError as exc:
-        return exc.code, dict(exc.headers), exc.read()
+import app  # noqa: E402
 
 
-class AndroidBoxTest(unittest.TestCase):
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class HandlerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
-        cls.server.daemon_threads = True
-        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
-        cls.thread.start()
-        host, port = cls.server.server_address
-        cls.base = "http://%s:%d" % (host, port)
+        cls.server = app.ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.base = "http://127.0.0.1:%s" % cls.port
 
     @classmethod
     def tearDownClass(cls):
         cls.server.shutdown()
         cls.server.server_close()
 
-    def test_index_page(self):
-        status, headers, body = request("GET", self.base + "/")
-        self.assertEqual(status, 200)
-        self.assertIn("text/html", headers["Content-Type"])
-        html = body.decode("utf-8")
-        self.assertIn("<title>安卓系统 · 在线真机</title>", html)
-        self.assertIn('src="app.js"', html)
-        self.assertNotIn("http://", html)
-        self.assertNotIn("https://", html)
+    def fetch(self, path, method="GET", follow=True):
+        req = urllib.request.Request(self.base + path, method=method)
+        opener = urllib.request.build_opener(NoRedirect) if not follow else urllib.request.build_opener()
+        try:
+            with opener.open(req, timeout=10) as resp:
+                return resp.status, dict(resp.headers), resp.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, dict(exc.headers), exc.read()
 
-    def test_frontend_stream_url(self):
-        status, _, body = request("GET", self.base + "/app.js")
-        self.assertEqual(status, 200)
-        js = body.decode("utf-8")
-        self.assertIn("stream.mjpg", js)
-        self.assertIn("api/input", js)
-        self.assertIn("api/install", js)
-
-    def test_static_assets(self):
-        for path, ctype in (
-            ("/style.css", "text/css"),
-            ("/app.js", "text/javascript"),
-            ("/favicon.svg", "image/svg+xml"),
-        ):
-            status, headers, body = request("GET", self.base + path)
-            self.assertEqual(status, 200, path)
-            self.assertIn(ctype, headers["Content-Type"], path)
-            self.assertTrue(body, path)
+    def fetch_with_headers(self, path, headers):
+        req = urllib.request.Request(self.base + path, headers=headers)
+        opener = urllib.request.build_opener(NoRedirect)
+        try:
+            with opener.open(req, timeout=10) as resp:
+                return resp.status, dict(resp.headers), resp.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, dict(exc.headers), exc.read()
 
     def test_health(self):
-        status, _, body = request("GET", self.base + "/api/health")
+        status, headers, body = self.fetch("/api/health")
         self.assertEqual(status, 200)
-        payload = json.loads(body)
-        self.assertTrue(payload["ok"])
-        self.assertEqual(payload["service"], "android-box")
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["mode"], "cloud-phone")
+        self.assertFalse(data["cloud_phone_configured"])
+        self.assertIn("no-store", headers.get("Cache-Control", ""))
 
-    def test_state_without_device(self):
-        status, _, body = request("GET", self.base + "/api/state")
-        self.assertEqual(status, 200)
-        payload = json.loads(body)
-        self.assertFalse(payload["adb_online"])
-        self.assertEqual(payload["serial"], app.ADB_SERIAL)
-        self.assertIn("stream", payload)
+    def test_ticket_unconfigured(self):
+        status, _, body = self.fetch("/api/cp/ticket")
+        self.assertEqual(status, 503)
+        self.assertFalse(json.loads(body)["ok"])
 
-    def test_apps_without_device(self):
-        status, _, body = request("GET", self.base + "/api/apps")
-        self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body)["packages"], [])
-
-    def test_input_validation(self):
-        cases = [
-            ({"type": "nope"}, 400),
-            ({"type": "key", "key": "NOT_A_KEY"}, 400),
-            ({"type": "text", "text": ""}, 400),
-            ({"type": "text", "text": "中文"}, 400),  # 仅支持 ASCII
-            ({}, 400),
-        ]
-        for payload, expected in cases:
-            status, _, _ = request("POST", self.base + "/api/input", payload)
-            self.assertEqual(status, expected, payload)
-
-    def test_input_reports_adb_failure(self):
-        status, _, body = request("POST", self.base + "/api/input", {"type": "tap", "x": 10, "y": 20})
+    def test_ticket_configured_but_no_credentials(self):
+        app.CLOUD_PHONE_INSTANCE = "acp-test"
+        try:
+            status, _, body = self.fetch("/api/cp/ticket")
+        finally:
+            app.CLOUD_PHONE_INSTANCE = ""
         self.assertEqual(status, 502)
-        self.assertIn("error", json.loads(body))
+        data = json.loads(body)
+        self.assertFalse(data["ok"])
+        self.assertIn("凭据", data["error"])
 
-    def test_install_rejects_empty(self):
-        status, _, _ = request("POST", self.base + "/api/install", raw=b"")
-        self.assertEqual(status, 400)
+    def test_index_page(self):
+        status, headers, body = self.fetch("/")
+        self.assertEqual(status, 200)
+        self.assertIn("text/html", headers["Content-Type"])
+        self.assertIn(b"WuyingWebSDK.js", body)
 
-    def test_unknown_routes(self):
-        for path in ("/nope", "/api/nope", "/../app.py"):
-            status, _, _ = request("GET", self.base + path)
+    def test_static_assets(self):
+        for path in ("/style.css", "/cloud.js", "/favicon.svg"):
+            status, _, body = self.fetch(path)
+            self.assertEqual(status, 200, path)
+            self.assertTrue(body, path)
+
+    def test_cloud_redirect(self):
+        status, headers, _ = self.fetch("/cloud/", follow=False)
+        self.assertEqual(status, 308)
+        self.assertEqual(headers["Location"], "/")
+
+    def test_cloud_redirect_with_prefix(self):
+        status, headers, _ = self.fetch_with_headers("/cloud/", {"X-Forwarded-Prefix": "/android"})
+        self.assertEqual(status, 308)
+        self.assertEqual(headers["Location"], "/android/")
+
+    def test_missing_page(self):
+        status, _, body = self.fetch("/nope")
+        self.assertEqual(status, 404)
+        self.assertFalse(json.loads(body)["ok"])
+
+    def test_cp_path_traversal(self):
+        for path in ("/cp/../app.py", "/cp/%2e%2e/app.py", "/sdk/../../app.py"):
+            status, _, _ = self.fetch(path)
             self.assertEqual(status, 404, path)
 
-    def test_unsupported_method(self):
-        status, _, _ = request("PUT", self.base + "/api/state")
+    def test_cp_asset_404(self):
+        status, _, _ = self.fetch("/cp/no-such-file.js")
+        self.assertEqual(status, 404)
+
+    def test_method_not_allowed(self):
+        status, _, _ = self.fetch("/api/health", method="POST")
         self.assertEqual(status, 405)
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    unittest.main()

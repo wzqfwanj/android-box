@@ -1,60 +1,48 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="color-scheme" content="dark" />
-  <meta name="description" content="在线真实安卓系统：容器里运行的 Android，浏览器里点按、滑屏、安装 APK。" />
+  <meta name="description" content="在线真安卓（ARM 云手机）：网页里直接操作阿里云无影云手机，可安装美团等 ARM 应用。" />
   <title>安卓系统 · 在线真机</title>
   <link rel="icon" href="favicon.svg" type="image/svg+xml" />
   <link rel="stylesheet" href="style.css" />
+  <script defer src="cp/WuyingWebSDK.js"></script>
+  <script defer src="cloud.js"></script>
 </head>
 <body>
   <main>
     <header class="head">
-      <div>
-        <h1>安卓系统 · 在线真机</h1>
-        <p class="sub">容器里运行的真实 Android，浏览器直接操作</p>
-      </div>
+      <h1>安卓系统 · 在线真机</h1>
+      <p class="sub">阿里云无影云手机 · Android 12 · arm64，网页里直接操作，可装美团等 ARM 应用</p>
     </header>
 
-    <div class="content">
-      <div class="stage">
-        <div class="phone" id="phone">
-          <div class="screen" id="screen">
-            <img class="frame" id="frame" alt="安卓设备实时画面" />
-            <canvas class="frame" id="screenCanvas" hidden aria-hidden="true"></canvas>
-            <div class="boot" id="boot">
-              <p class="boot-title">正在连接安卓系统…</p>
-              <p class="boot-note" id="bootNote">等待 adb 设备与推流管线就绪</p>
-            </div>
+    <div class="stage">
+      <div class="phone">
+        <div class="screen">
+          <div class="cloud-container" id="cloudContainer">
+            <iframe id="sessionIframe" title="云手机画面"></iframe>
+          </div>
+          <div class="boot" id="boot">
+            <p class="boot-title">正在连接云手机…</p>
+            <p class="boot-note" id="bootNote">获取连接凭证 — 云端串流</p>
           </div>
         </div>
-
-        <div class="toolbar" id="toolbar">
-          <button class="btn" type="button" data-key="BACK">返回</button>
-          <button class="btn" type="button" data-key="HOME">主屏</button>
-          <button class="btn" type="button" data-key="APP_SWITCH">最近任务</button>
-          <button class="btn" type="button" data-key="VOLUME_DOWN">音量 −</button>
-          <button class="btn" type="button" data-key="VOLUME_UP">音量 +</button>
-          <button class="btn" type="button" data-key="POWER">电源</button>
-          <label class="btn file-btn">安装 APK<input id="apkInput" type="file" accept=".apk,application/vnd.android.package-archive" hidden /></label>
-          <button class="btn" type="button" id="reconnect">重连画面</button>
-          <a class="btn file-btn" href="cloud.html">ARM 云手机</a>
-        </div>
-
-        <p class="status" id="status">初始化…</p>
-        <p class="hint">点按 = 触摸 · 拖动 = 滑屏 · 输入文字请点设备里的输入框用软键盘</p>
       </div>
+
+      <div class="toolbar">
+        <button class="btn" type="button" id="reconnect">重连</button>
+        <button class="btn" type="button" id="fullscreen">全屏画面</button>
+      </div>
+
+      <p class="status" id="status">初始化…</p>
+      <p class="hint">画面来自阿里云真机，直接在画面上点按 / 滑动 / 输入；装 APK 请在云手机控制台操作或告诉我。</p>
     </div>
   </main>
 
-  <div class="toast" id="toast" role="status" aria-live="polite"></div>
-
   <noscript>
-    <p class="noscript-note">操作安卓系统需要开启 JavaScript。</p>
+    <p class="noscript-note">操作云手机需要开启 JavaScript。</p>
   </noscript>
-
-  <script src="app.js"></script>
 </body>
 </html>
