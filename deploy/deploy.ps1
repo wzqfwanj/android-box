@@ -68,7 +68,7 @@ fi
 systemctl enable android-box >/dev/null 2>&1 || true
 systemctl restart android-box
 '@
-    $remote | ssh $appHost "bash -s"
+    ($remote -replace "`r`n", "`n") | ssh $appHost "bash -s"
     if ($LASTEXITCODE -ne 0) { Fail "网关机更新失败。排查：ssh $appHost 'journalctl -u android-box -n 100 --no-pager'" }
 
     Log "健康检查 ..."
