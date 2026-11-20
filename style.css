@@ -240,6 +240,30 @@ h1 {
   transform: translate(-50%, 0);
 }
 
+/* 即时点击涟漪（本地反馈，不等真实画面） */
+.tap-ripple {
+  position: fixed;
+  width: 30px;
+  height: 30px;
+  margin: -15px 0 0 -15px;
+  border: 1px solid var(--fg);
+  border-radius: 50%;
+  pointer-events: none;
+  z-index: 30;
+  animation: tap-ripple 0.28s ease-out forwards;
+}
+
+@keyframes tap-ripple {
+  from {
+    opacity: 0.8;
+    transform: scale(0.55);
+  }
+  to {
+    opacity: 0;
+    transform: scale(1.5);
+  }
+}
+
 /* ---------- 响应式 ---------- */
 
 @media (max-width: 560px) {

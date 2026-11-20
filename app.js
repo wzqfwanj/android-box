@@ -34,6 +34,19 @@
     }, 2400);
   }
 
+  // 点击/按下即时涟漪：真实画面要等下一帧截图（~150-250ms），
+  // 先用本地涟漪给出「已收到操作」的即时反馈。
+  function showRipple(clientX, clientY) {
+    var el = document.createElement("span");
+    el.className = "tap-ripple";
+    el.style.left = clientX + "px";
+    el.style.top = clientY + "px";
+    document.body.appendChild(el);
+    setTimeout(function () {
+      if (el.parentNode) el.parentNode.removeChild(el);
+    }, 320);
+  }
+
   function setStatus(text) {
     var el = $("#status");
     if (el) el.textContent = text;
@@ -107,11 +120,13 @@
   }
 
   function sendTap(clientX, clientY) {
+    showRipple(clientX, clientY);
     var point = toDevice(clientX, clientY);
     postInput({ type: "tap", x: point.x, y: point.y });
   }
 
   function sendSwipe(x1, y1, x2, y2, duration) {
+    showRipple(x1, y1);
     var a = toDevice(x1, y1);
     var b = toDevice(x2, y2);
     postInput({ type: "swipe", x1: a.x, y1: a.y, x2: b.x, y2: b.y, duration: duration });
