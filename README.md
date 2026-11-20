@@ -7,6 +7,9 @@
 
 **在线地址：** <https://wkeeli.cn/android/>
 
+> 这是原「安卓手机模拟器」的正式替代品：`/phone/` 已停用并 308 跳转到 `/android/`，
+> 旧界面模拟器代码保留在 [wzqfwanj/phone-sim](https://github.com/wzqfwanj/phone-sim) 仓库。
+
 站点由**全站 Basic Auth** 保护，访问时需使用站点账号 `wkeeli` 登录（密码由站点管理员维护，本仓库不含密码）。
 应用内部没有独立登录页，认证完全由网关负责。
 
