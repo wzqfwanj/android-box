@@ -175,10 +175,30 @@ class ScrcpyInjector:
         self.sock = None
         self.width, self.height = 480, 854
         self.last_error = ""
+        self.warming = False
 
     @property
     def ready(self):
         return self.sock is not None
+
+    def warm_async(self):
+        """后台预热注入通道，避免第一个请求被 2~3 秒的初始化阻塞。"""
+        if self.sock is not None:
+            return True
+        with self.lock:
+            if self.warming:
+                return False
+            self.warming = True
+
+        def run():
+            try:
+                self.ensure()
+            finally:
+                with self.lock:
+                    self.warming = False
+
+        threading.Thread(target=run, daemon=True).start()
+        return False
 
     def ensure(self):
         with self.lock:
@@ -736,8 +756,10 @@ class Handler(BaseHTTPRequestHandler):
 
         via = "scrcpy"
         try:
-            if not INJECTOR.ensure():
-                raise RuntimeError(INJECTOR.last_error or "注入通道未就绪")
+            if not INJECTOR.ready:
+                # 不阻塞请求：后台预热，本次先用 adb 回退（后续请求走常驻通道）
+                INJECTOR.warm_async()
+                raise RuntimeError("注入通道预热中")
             if kind == "tap":
                 INJECTOR.tap(int(payload.get("x", 0)), int(payload.get("y", 0)))
             elif kind == "swipe":
