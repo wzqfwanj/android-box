@@ -3,7 +3,7 @@
 > 容器里跑的**真实 Android**（AOSP Android 11，x86_64）：浏览器看实时画面、直接点按操作、上传安装 APK。
 > 不是界面模拟，所有操作都注入真正的 Android 系统。
 
-`Python 3.12 标准库` · `零第三方依赖` · `零构建` · `Android 11 / x86_64` · `MIT License`
+`Python 3.12 标准库 + Pillow` · `零构建` · `Android 11 / x86_64` · `MIT License`
 
 **在线地址：** <https://wkeeli.cn/android/>
 
@@ -27,7 +27,7 @@
 
 | 能力 | 说明 |
 | --- | --- |
-| 实时画面 | 容器内 Android 屏幕经 `adb screenrecord`（H.264）→ `ffmpeg` 转 MJPEG → 浏览器 `<img>` 实时显示；`screenrecord` 不可用时自动降级为逐帧 `screencap` |
+| 实时画面 | 容器内 Android 屏幕用 `adb screencap`（raw）持续取样，Pillow 转 JPEG 后以 MJPEG 推给浏览器：每帧 ~150~200ms、约 6~8fps，**没有 H.264 编码器排队延迟**；系统里没装 Pillow 时自动回退 `screenrecord`+`ffmpeg` 管线 |
 | 触摸操作 | 点按 = 设备触摸，拖动 = 滑屏；浏览器坐标按设备分辨率换算后经**常驻注入通道**（scrcpy-server）注入真实系统，实测 ~30ms；通道异常时自动回退 `adb shell input` |
 | 按键控制 | 返回 / 主屏 / 最近任务 / 音量 − / 音量 + / 电源（常驻注入通道，实测 ~30ms） |
 | 低延迟注入 | 内置 `scrcpy-server v2.4`（Apache-2.0，© Genymobile）常驻设备端，避免每次 `adb shell input` 冷启动 Java 进程（实测 700~800ms → ~30ms） |
@@ -42,8 +42,8 @@
 | 层 | 选型 | 说明 |
 | --- | --- | --- |
 | 设备 | redroid（AOSP Android 11，x86_64） | Docker 容器里运行的真实 Android，`--privileged` + binderfs |
-| 后端 | Python 3.12 标准库 | `http.server` + `threading` + `subprocess`，单文件 `app.py`，无第三方依赖、无需 pip |
-| 画面 | `adb` + `ffmpeg` | `adb exec-out screenrecord`(H.264) → `ffmpeg` 转 MJPEG → `multipart/x-mixed-replace` 流；异常时降级逐帧截图 |
+| 后端 | Python 3.12 标准库 + Pillow | `http.server` + `threading` + `subprocess`；Pillow 用系统包 `python3-pil`（apt，不需要 pip、无 requirements） |
+| 画面 | `adb screencap` + Pillow | 原始帧缓冲截图（~150ms）→ Pillow 转 JPEG（~5~20ms）→ `multipart/x-mixed-replace`；单路取样延迟最低，`CAPTURE_WORKERS` 可调并发 |
 | 输入 | scrcpy-server 常驻通道（回退 `adb shell input`） | 维护一条到设备的长连接，触摸/按键只写几十字节；服务端自带重连与 jar 自动重推 |
 | 前端 | 原生 HTML + CSS + JavaScript | 零依赖、零构建，无框架、无 CDN、无网络字体 |
 | 部署 | systemd + Docker + Caddy | `redroid.service` 管容器、`android-box.service` 管 Web 服务；Caddy 子路径反代并关闭响应缓冲 |
@@ -118,6 +118,8 @@ android-box/
 | `STREAM_Q` | `7` | MJPEG 质量（2~31，越小越清晰、越费 CPU/带宽） |
 | `APP_TZ` | `Asia/Shanghai` | 日志与接口时间时区 |
 | `SCRCPY_PORT` | `27183` | 低延迟注入通道的 adb forward 本地端口 |
+| `CAPTURE_WORKERS` | `1` | 截图并发数（1 延迟最低，2~3 帧率更高但单帧更慢） |
+| `JPEG_QUALITY` | `65` | Pillow 输出 JPEG 质量（越小越省带宽） |
 | `ADB_BIN` | `adb` | adb 可执行文件路径（可选） |
 | `FFMPEG_BIN` | `ffmpeg` | ffmpeg 可执行文件路径（可选） |
 
@@ -179,9 +181,11 @@ bash deploy/deploy.sh
 
 - **指令集**：容器是 x86_64 Android。**仅支持 ARM 的 APK 装不上**（`INSTALL_FAILED_NO_MATCHING_ABIS`），
   需要 x86_64 或包含 x86_64 的 universal APK。
-- **性能**：应用机为 2 vCPU / 3.4GB，画面默认约 **8fps**（480×854）；
-  输入走常驻注入通道，实测 **~30ms**（回退 `adb shell input` 时约 700ms）；
-  画面参数（`STREAM_W` / `STREAM_FPS` / `STREAM_Q`）可在 `/etc/android-box.env` 调整。
+- **性能**：应用机为 2 vCPU / 3.4GB，画面约 **6~8fps**（480×854）；
+  输入注入 **<5ms**（走常驻通道），从操作到画面变化在浏览器里实测 **~300~450ms**——
+  瓶颈是「软件渲染的 guest 绘制一帧 + 截图回读 ~150ms」，不是网络或输入；
+  点击/按键有**本地即时涟漪**反馈（<20ms），不用等真实画面。
+  可调参数：`CAPTURE_WORKERS`（1 延迟最低）、`JPEG_QUALITY`、`STREAM_W`。
 - **系统镜像**：AOSP Android 11，**没有 GApps / Google Play 服务**，依赖 Google 服务的应用无法使用。
 - **音频**：只传输画面，**没有声音**。
 - **单设备单实例**：一个 redroid 容器、一个 `ADB_SERIAL`；多人同时打开会看到同一画面并共享操作。
@@ -195,7 +199,8 @@ bash deploy/deploy.sh
 
 - **灰阶单主题**：`:root` 只定义 `--bg`、`--fg`、`--muted`、`--line`、`--hover` 五个变量；
   无浅色/深色切换，无主题切换按钮。
-- **零依赖、零构建、零外链**：后端仅用 Python 标准库（无需 pip），外部命令只有系统级 `adb` 与 `ffmpeg`；
+- **零构建、零外链**：后端只用 Python 标准库 + 系统包 Pillow（`python3-pil`，apt 安装、不需要 pip/requirements）；
+  外部命令只有系统级 `adb` 与 `ffmpeg`（后者仅在 Pillow 缺失的兜底管线中使用）；
   前端原生 HTML/CSS/JS（无包管理器、无打包步骤）；页面不引用任何 CDN、第三方脚本、网络字体或外部图片，
   实时画面是**同源** `<img src="stream.mjpg">`。
 - **JavaScript 的使用理由**：实时画面挂载与断流重连、把点按/拖动换算成设备坐标、按键注入、

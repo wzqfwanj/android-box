@@ -41,7 +41,8 @@
 - 部署机（本地 Windows Git Bash）具备 `git`、`ssh`、`scp`、`tar`、`curl`。
 - 本地已配置 ssh 别名：`ssh dev`、`ssh aliyun` 可直接 root 登录。
 - 应用机：**无需访问 GitHub、无需安装 git**；python3 ≥ 3.10（Ubuntu 24.04 自带 3.12）；
-  已 `apt install adb ffmpeg`；Docker 已安装并运行；`8150` 端口与容器映射的 `5555` 未被占用
+  已 `apt install adb ffmpeg python3-pil`（Pillow 用于把原始截图快速转 JPEG，缺失时会退回 ffmpeg 管线）；
+  Docker 已安装并运行；`8150` 端口与容器映射的 `5555` 未被占用
   （同机的 phone-sim 占用 8140，互不影响）。
 - 应用机内核支持 binder（已实测 `modprobe binder_linux` 与 binderfs 挂载可用，见第 2 节）。
 - 网关机能出站访问 `180.76.180.249:8150`（安全组/防火墙放行；应用机不要把 5555/8150 暴露到公网）。
@@ -50,8 +51,8 @@
 部署前先确认环境：
 
 ```bash
-# 应用机：python3、adb、ffmpeg、docker、端口
-ssh dev 'python3 -V; command -v adb ffmpeg docker; docker info >/dev/null && echo docker-ok; ss -lntp | grep -E ":(5555|8150)" || echo "5555/8150 空闲"'
+# 应用机：python3、adb、ffmpeg、python3-pil、docker、端口
+ssh dev 'python3 -V; command -v adb ffmpeg docker; python3 -c "import PIL; print(\"PIL ok\")"; docker info >/dev/null && echo docker-ok; ss -lntp | grep -E ":(5555|8150)" || echo "5555/8150 空闲"'
 # 网关机：Caddy 与站点配置
 ssh aliyun 'caddy version; ls -l /etc/caddy/Caddyfile'
 ```
