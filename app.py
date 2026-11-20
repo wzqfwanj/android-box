@@ -379,6 +379,8 @@ class FrameHub:
         self.seed_lock = threading.Lock()
         self.last_publish = 0.0
         self.last_refresh = 0.0
+        self.burst_running = False
+        self.burst_pending = False
 
     # ---- 采集线程 ----
 
@@ -504,40 +506,70 @@ class FrameHub:
             self._publish(buf[start:end + 2])
             buf = buf[end + 2:]
 
-    def _poll_worker(self):
-        """raw 截图轮询：每帧都是「当前屏幕」的即时截图，没有编码器排队延迟。"""
+    def _capture_once(self):
+        try:
+            jpeg = capture_jpeg_raw()
+            if jpeg:
+                self._publish(jpeg)
+                return True
+        except Exception as exc:  # noqa: BLE001
+            self._set_error("截图失败：%s" % exc)
+        return False
+
+    def _burst(self, delays):
+        """输入后连拍几帧：首帧立即开始（约 150ms 出图），后续帧覆盖过渡动画。
+
+        「输入即拍」比持续轮询少掉「等下一次轮询开始」的时间（平均 ~80ms），
+        空闲时也完全不占 CPU。
+        """
+        previous = 0.0
+        for delay in delays:
+            time.sleep(max(0.0, delay - previous))
+            previous = delay
+            if not self.running:
+                return
+            if not self._capture_once():
+                return
+
+    def request_capture(self, delays=(0.0, 0.10, 0.25, 0.45, 0.70, 1.0)):
+        if self.mode != "ondemand":
+            return
+        with self.lock:
+            if self.burst_running:
+                self.burst_pending = True
+                return
+            self.burst_running = True
+
+        def run():
+            try:
+                self._burst(delays)
+                while self.burst_pending and self.running:
+                    self.burst_pending = False
+                    time.sleep(0.08)
+                    self._capture_once()
+            finally:
+                with self.lock:
+                    self.burst_running = False
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _supervise_ondemand(self):
+        """事件驱动的画面：客户端在时低频兜底刷新，输入时由 request_capture 连拍。"""
+        self.mode = "ondemand"
+        self.request_capture((0.0,))
         while self.running:
             if self.stop_at and time.time() > self.stop_at:
                 break
-            try:
-                jpeg = capture_jpeg_raw()
-                if jpeg:
-                    self._publish(jpeg)
-                else:
-                    time.sleep(0.2)
-            except Exception as exc:  # noqa: BLE001
-                self._set_error("截图失败：%s" % exc)
-                time.sleep(0.5)
-        if self.mode == "poll" and not self.running:
-            return
-
-    def _supervise_poll(self):
-        """并行 raw 截图（默认 2 路 ≈ 7fps），每帧延迟稳定 ~200ms。"""
-        self.mode = "poll"
-        threads = [
-            threading.Thread(target=self._poll_worker, daemon=True)
-            for _ in range(CAPTURE_WORKERS)
-        ]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
+            # 空闲兜底：每 3 秒补一帧（时钟/通知等无输入的变化）
+            if self.clients > 0 and time.time() - self.last_publish > 3.0:
+                self._capture_once()
+            time.sleep(0.4)
 
     def _supervise(self):
         self.running = True
         try:
             if HAS_PIL:
-                self._supervise_poll()
+                self._supervise_ondemand()
             else:
                 self._seed_frame()  # 无 Pillow 时退回 ffmpeg 管线，先给一帧静态画面
                 while self.running:
@@ -585,14 +617,18 @@ class FrameHub:
         with self.cond:
             self.clients += 1
         self._start()
-        # 管线可能还在（最后一个客户端断开后保留 15 秒），此时 HUB 里可能是旧画面；
-        # 屏幕静止时 screenrecord 也不会产新帧，所以给新客户端补一张当前截图。
+        if self.mode == "ondemand":
+            # 事件驱动：新客户端接入时立即补一帧当前画面
+            threading.Thread(target=self.request_capture, args=((0.0,),), daemon=True).start()
+            return
+        # 退回 ffmpeg 管线时：管线可能还在（最后一个客户端断开后保留 15 秒），
+        # HUB 里可能是旧画面，给新客户端补一张当前截图。
         if self.running and (time.time() - self.last_publish > 2):
             threading.Thread(target=self._refresh_seed, daemon=True).start()
 
     def _refresh_seed(self):
-        if self.mode == "poll":
-            return  # 轮询模式下每帧都是最新截图，无需补帧
+        if self.mode in ("poll", "ondemand"):
+            return  # 事件驱动/轮询模式自己会出帧
         if not self.seed_lock.acquire(blocking=False):
             return
         try:
@@ -603,10 +639,14 @@ class FrameHub:
             self.seed_lock.release()
 
     def request_refresh(self):
-        """输入注入后按需补「操作完成后的最终画面」。
+        """输入注入后立即抓帧。
 
-        轮询模式（默认）每帧都是即时截图，不需要补帧；只有退回 ffmpeg 管线时才补。
+        - ondemand 模式：触发一次连拍（首帧立即开始 ≈150ms 出图，无需等轮询）
+        - 只有退回 ffmpeg 管线时才走旧的补帧逻辑
         """
+        if self.mode == "ondemand":
+            self.request_capture()
+            return
         if self.mode == "poll":
             return
         injected_at = time.time()
