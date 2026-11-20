@@ -201,6 +201,9 @@
           height: { ideal: 1280 },
           aspectRatio: { ideal: 9 / 16 },
         });
+        if (!c.video.facingMode && !c.video.deviceId) {
+          c.video.facingMode = { ideal: "user" }; // 人脸核身用前置摄像头
+        }
       }
       return orig(c).then(function (stream) {
         if (!wantsVideo) return stream;
