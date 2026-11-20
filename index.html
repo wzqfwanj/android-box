@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark" />
+  <meta name="description" content="在线真实安卓系统：容器里运行的 Android，浏览器里点按、滑屏、安装 APK。" />
+  <title>安卓系统 · 在线真机</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main>
+    <header class="head">
+      <div>
+        <h1>安卓系统 · 在线真机</h1>
+        <p class="sub">容器里运行的真实 Android，浏览器直接操作</p>
+      </div>
+    </header>
+
+    <div class="content">
+      <div class="stage">
+        <div class="phone" id="phone">
+          <div class="screen" id="screen">
+            <img class="frame" id="frame" alt="安卓设备实时画面" />
+            <div class="boot" id="boot">
+              <p class="boot-title">正在连接安卓系统…</p>
+              <p class="boot-note" id="bootNote">等待 adb 设备与推流管线就绪</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="toolbar" id="toolbar">
+          <button class="btn" type="button" data-key="BACK">返回</button>
+          <button class="btn" type="button" data-key="HOME">主屏</button>
+          <button class="btn" type="button" data-key="APP_SWITCH">最近任务</button>
+          <button class="btn" type="button" data-key="VOLUME_DOWN">音量 −</button>
+          <button class="btn" type="button" data-key="VOLUME_UP">音量 +</button>
+          <button class="btn" type="button" data-key="POWER">电源</button>
+          <label class="btn file-btn">安装 APK<input id="apkInput" type="file" accept=".apk,application/vnd.android.package-archive" hidden /></label>
+          <button class="btn" type="button" id="reconnect">重连画面</button>
+        </div>
+
+        <p class="status" id="status">初始化…</p>
+        <p class="hint">点按 = 触摸 · 拖动 = 滑屏 · 输入文字请点设备里的输入框用软键盘</p>
+      </div>
+    </div>
+  </main>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <noscript>
+    <p class="noscript-note">操作安卓系统需要开启 JavaScript。</p>
+  </noscript>
+
+  <script src="app.js"></script>
+</body>
+</html>

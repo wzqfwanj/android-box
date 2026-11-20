@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+
+# 本地运行时数据（生产数据在 /var/lib/android-box，不入库）
+data/
+
+# 虚拟环境
+.venv/
+
+# 临时目录（本地运行、发布打包用）
+.tmp-*/
+
+# 本地测试上传的 APK / 导出的镜像包
+*.apk
+*.tar.gz
+
+# 操作系统杂项
+Thumbs.db
+.DS_Store
