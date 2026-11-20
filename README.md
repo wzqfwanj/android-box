@@ -27,8 +27,8 @@
 
 | 能力 | 说明 |
 | --- | --- |
-| 实时画面 | 容器内 Android 屏幕用 `adb screencap`（raw）持续取样，Pillow 转 JPEG 后以 MJPEG 推给浏览器：每帧 ~150~200ms、约 6~8fps，**没有 H.264 编码器排队延迟**；系统里没装 Pillow 时自动回退 `screenrecord`+`ffmpeg` 管线 |
-| 触摸操作 | 点按 = 设备触摸，拖动 = 滑屏；浏览器坐标按设备分辨率换算后经**常驻注入通道**（scrcpy-server）注入真实系统，实测 ~30ms；通道异常时自动回退 `adb shell input` |
+| 实时画面 | 优先走 **scrcpy 视频流**（H.264，30fps 上限）→ `ffmpeg` 转 MJPEG，端到端实测 **~10~150ms**；不可用时自动回退「raw 截图轮询」（`adb screencap` + Pillow，~150~200ms/帧）或 `screenrecord`+`ffmpeg` |
+| 触摸操作 | 点按 = 设备触摸，拖动 = 滑屏；浏览器坐标按设备分辨率换算后经**常驻注入通道**（scrcpy-server）注入真实系统，实测 ~1~4ms（网关往返 ~30~60ms）；通道异常时自动回退 `adb shell input` |
 | 按键控制 | 返回 / 主屏 / 最近任务 / 音量 − / 音量 + / 电源（常驻注入通道，实测 ~30ms） |
 | 低延迟注入 | 内置 `scrcpy-server v2.4`（Apache-2.0，© Genymobile）常驻设备端，避免每次 `adb shell input` 冷启动 Java 进程（实测 700~800ms → ~30ms） |
 | 上传装 APK | 页面选择 APK 上传（上限 500MB），后端 `adb install -r -g` 安装，页面显示上传进度与安装结果 |
@@ -41,12 +41,12 @@
 
 | 层 | 选型 | 说明 |
 | --- | --- | --- |
-| 设备 | redroid（AOSP Android 11，x86_64） | Docker 容器里运行的真实 Android，`--privileged` + binderfs |
+| 设备 | redroid（AOSP Android 11，x86_64）或 Windows 模拟器 | 方案 A：Docker 容器里运行的真实 Android；方案 B：家用 Windows PC 上的硬件加速（WHPX）模拟器 |
 | 后端 | Python 3.12 标准库 + Pillow | `http.server` + `threading` + `subprocess`；Pillow 用系统包 `python3-pil`（apt，不需要 pip、无 requirements） |
-| 画面 | `adb screencap` + Pillow | 原始帧缓冲截图（~150ms）→ Pillow 转 JPEG（~5~20ms）→ `multipart/x-mixed-replace`；单路取样延迟最低，`CAPTURE_WORKERS` 可调并发 |
+| 画面 | scrcpy 视频流 → ffmpeg（回退 screencap 轮询） | 视频模式 30fps 上限、端到端 ~10~150ms；截图模式 ~150~200ms/帧；统一转 MJPEG 供浏览器 `<img>` |
 | 输入 | scrcpy-server 常驻通道（回退 `adb shell input`） | 维护一条到设备的长连接，触摸/按键只写几十字节；服务端自带重连与 jar 自动重推 |
 | 前端 | 原生 HTML + CSS + JavaScript | 零依赖、零构建，无框架、无 CDN、无网络字体 |
-| 部署 | systemd + Docker + Caddy | `redroid.service` 管容器、`android-box.service` 管 Web 服务；Caddy 子路径反代并关闭响应缓冲 |
+| 部署 | systemd + Docker + Caddy / 家用 PC | 方案 A：`redroid.service` + `android-box.service` + Caddy 子路径反代；方案 B：Windows 上跑模拟器与 android-box，经 SSH 反向隧道接到网关（Caddy 优先 PC、健康检查失败自动回退方案 A） |
 
 ## 目录结构
 
@@ -177,15 +177,49 @@ bash deploy/deploy.sh
 > 应用机无法访问 GitHub，因此代码由部署机本地 `git archive` 打包后 scp 同步；
 > 应用机上的 `/opt/android-box` 是普通目录，不是 git 仓库。
 
+### 部署方案 B：家用 Windows PC（硬件加速模拟器 + SSH 反向隧道）
+
+低延迟优先时，可以把 Android 跑在自己 Windows 电脑的硬件加速模拟器里（WHPX），
+本机跑 `android-box`，再用 SSH 反向隧道接到网关。Caddy 会**优先**把 `/android/`
+代理到 PC，PC 不在线时通过健康检查自动回退到方案 A 的 redroid。
+
+```
+Windows: emulator(WHPX) ──adb──> android-box(127.0.0.1:8150) ──ssh -R──> aliyun:127.0.0.1:8150
+Caddy: /android/* -> [127.0.0.1:8150(PC, 优先), 180.76.180.249:8150(方案A, 回退)]
+```
+
+| 文件 | 用途 |
+| --- | --- |
+| [windows/create-avd.ps1](windows/create-avd.ps1) | 创建 480×854 / Android 11 x86_64 的 AVD `wkeeli` |
+| [windows/start-android-box.ps1](windows/start-android-box.ps1) | 启动模拟器 + android-box + SSH 反向隧道（隧道断线自动重连） |
+| [windows/stop-android-box.ps1](windows/stop-android-box.ps1) | 停止模拟器 / 服务 / 隧道 |
+| [windows/install-startup.ps1](windows/install-startup.ps1) | 安装「登录自动启动」（当前用户 Startup，无需管理员） |
+
+PC 端依赖：Windows 10/11（开启「Windows 虚拟机监控程序平台 / WHPX」）、
+Android SDK（`platform-tools`、`emulator`、`system-images;android-30;default;x86_64`）、
+`ffmpeg`（`C:\Android\tools\ffmpeg\ffmpeg.exe`）、Python 3 + Pillow。
+
+```powershell
+# 首次：建 AVD，然后启动（模拟器 headless、服务 127.0.0.1:8150、隧道自动重连）
+powershell -ExecutionPolicy Bypass -File windows\create-avd.ps1
+powershell -ExecutionPolicy Bypass -File windows\start-android-box.ps1
+# 登录自启：把 start 脚本放进当前用户 Startup
+powershell -ExecutionPolicy Bypass -File windows\install-startup.ps1
+```
+
+实测（Windows 11 / Ryzen 7 6800H）：本机浏览器「操作→画面变化」**11~147ms**（均值 ~53ms），
+经网关输入往返 **31~57ms**；画面 30fps 上限，静止画面不产帧（新客户端接入时自动补一张当前截图）。
+PC 睡眠/关机/断网时，Caddy 健康检查（`/api/health`，4s 间隔）会在约 8 秒内把 PC 摘除，
+流量自动回退到方案 A（页面提示为 server 的 redroid）。
+
 ## 限制与边界
 
 - **指令集**：容器是 x86_64 Android。**仅支持 ARM 的 APK 装不上**（`INSTALL_FAILED_NO_MATCHING_ABIS`），
   需要 x86_64 或包含 x86_64 的 universal APK。
-- **性能**：应用机为 2 vCPU / 3.4GB，画面约 **6~8fps**（480×854）；
-  输入注入 **<5ms**（走常驻通道），从操作到画面变化在浏览器里实测 **~300~450ms**——
-  瓶颈是「软件渲染的 guest 绘制一帧 + 截图回读 ~150ms」，不是网络或输入；
-  点击/按键有**本地即时涟漪**反馈（<20ms），不用等真实画面。
-  可调参数：`CAPTURE_WORKERS`（1 延迟最低）、`JPEG_QUALITY`、`STREAM_W`。
+- **性能**：方案 A（2 vCPU / 3.4GB 的 redroid）：截图轮询约 6~8fps，浏览器端「操作→画面变化」实测 ~300~450ms；
+  方案 B（家用 PC + WHPX 模拟器）：scrcpy 视频流（30fps 上限），本机浏览器实测 **~10~150ms**。
+  输入注入始终 **<5ms**（常驻通道），点击还有本地即时涟漪反馈（<20ms）。
+  可调参数：`SCRCPY_VIDEO`（1 视频流 / 0 截图轮询）、`CAPTURE_WORKERS`、`JPEG_QUALITY`、`STREAM_W`。
 - **系统镜像**：AOSP Android 11，**没有 GApps / Google Play 服务**，依赖 Google 服务的应用无法使用。
 - **音频**：只传输画面，**没有声音**。
 - **单设备单实例**：一个 redroid 容器、一个 `ADB_SERIAL`；多人同时打开会看到同一画面并共享操作。

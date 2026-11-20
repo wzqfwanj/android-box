@@ -55,6 +55,10 @@ START_TIME = time.time()
 SCRCPY_JAR = os.path.join(BASE_DIR, "assets", "scrcpy-server-v2.4")
 DEVICE_JAR = "/data/local/tmp/scrcpy-server.jar"
 SCRCPY_PORT = int(os.environ.get("SCRCPY_PORT", "27183"))
+# 默认用 scrcpy 视频流（H.264，30fps 上限）→ ffmpeg 转 MJPEG：
+# 比「截图轮询」少一次回读，实测帧到达 ~50~200ms；失败时自动回退截图轮询。
+SCRCPY_VIDEO = os.environ.get("SCRCPY_VIDEO", "1") == "1"
+SCRCPY_VIDEO_BITRATE = int(os.environ.get("SCRCPY_VIDEO_BITRATE", "4000000"))
 
 # 画面：默认用并行 raw 截图轮询（每帧都是最新截图，延迟稳定 ~200ms）；
 # 没装 Pillow 时自动退回 screenrecord+ffmpeg 的 MJPEG 管线。
@@ -213,13 +217,19 @@ class ScrcpyInjector:
     def __init__(self):
         self.lock = threading.Lock()
         self.sock = None
+        self.video = None
+        self.encoded_width, self.encoded_height = 0, 0
         self.width, self.height = 480, 854
         self.last_error = ""
         self.warming = False
 
     @property
     def ready(self):
-        return self.sock is not None
+        return self.sock is not None and (self.video is not None or not SCRCPY_VIDEO)
+
+    @property
+    def video_ready(self):
+        return self.video is not None
 
     def warm_async(self):
         """后台预热注入通道，避免第一个请求被 2~3 秒的初始化阻塞。"""
@@ -258,7 +268,7 @@ class ScrcpyInjector:
             return adb(args, timeout=timeout)
 
     def _setup_locked(self):
-        # 1) 设备上没有 jar 就推送（容器重建后 /data/local/tmp 会清空）
+        # 1) 设备上没有 jar 就推送（容器重建 / 模拟器重启后 /data/local/tmp 可能被清）
         rc, _, _ = self._adb_locked(["shell", "test", "-f", DEVICE_JAR], timeout=8)
         if rc != 0:
             if not os.path.exists(SCRCPY_JAR):
@@ -267,42 +277,108 @@ class ScrcpyInjector:
             if rc != 0:
                 raise RuntimeError("推送 scrcpy-server 失败：%s" % err)
 
-        # 2) 重启注入服务
+        # 2) 重启注入/画面服务（视频 + 控制共用一个进程）
         self._adb_locked(["shell", "pkill", "-f", "com.genymobile.scrcpy.Server"], timeout=8)
         time.sleep(0.2)
+        video_arg = "true" if SCRCPY_VIDEO else "false"
+        codec_meta = "true" if SCRCPY_VIDEO else "false"
+        frame_meta = "true" if SCRCPY_VIDEO else "false"
         cmd = (
             "CLASSPATH=%s app_process / com.genymobile.scrcpy.Server 2.4 "
-            "log_level=error video=false audio=false control=true tunnel_forward=true "
-            "send_device_meta=true send_dummy_byte=true cleanup=false "
-            ">/data/local/tmp/scrcpy.log 2>&1 &" % DEVICE_JAR
+            "log_level=error video=%s audio=false control=true tunnel_forward=true "
+            "send_device_meta=true send_codec_meta=%s send_frame_meta=%s send_dummy_byte=true "
+            "cleanup=false max_fps=30 video_bit_rate=%d "
+            ">/data/local/tmp/scrcpy.log 2>&1 &"
+            % (DEVICE_JAR, video_arg, codec_meta, frame_meta, SCRCPY_VIDEO_BITRATE)
         )
         self._adb_locked(["shell", cmd], timeout=10)
         time.sleep(1.2)
 
-        # 3) adb forward + 握手（1 字节 dummy + 64 字节设备名）
+        # 3) adb forward + 握手（服务端 app_process 启动需要一点时间，失败重试几次）
         self._adb_locked(["forward", "tcp:%d" % SCRCPY_PORT, "localabstract:scrcpy"], timeout=8)
-        sock = socket.create_connection(("127.0.0.1", SCRCPY_PORT), timeout=6)
-        sock.settimeout(6)
-        dummy = sock.recv(1)
-        if dummy != b"\x00":
-            sock.close()
-            raise RuntimeError("scrcpy 握手失败（dummy=%r）" % dummy)
-        meta = b""
-        while len(meta) < 64:
-            chunk = sock.recv(64 - len(meta))
+        last_exc = None
+        for attempt in range(6):
+            video = None
+            control = None
+            try:
+                if SCRCPY_VIDEO:
+                    video = socket.create_connection(("127.0.0.1", SCRCPY_PORT), timeout=6)
+                    video.settimeout(6)
+                    dummy = video.recv(1)
+                    if dummy != b"\x00":
+                        raise RuntimeError("scrcpy 视频通道握手失败（dummy=%r）" % dummy)
+                control = socket.create_connection(("127.0.0.1", SCRCPY_PORT), timeout=6)
+                control.settimeout(6)
+                if video is not None:
+                    # 先连 control，服务端才会继续发送 device meta / codec meta
+                    meta = b""
+                    while len(meta) < 64:
+                        chunk = video.recv(64 - len(meta))
+                        if not chunk:
+                            break
+                        meta += chunk
+                    codec = b""
+                    while len(codec) < 12:
+                        chunk = video.recv(12 - len(codec))
+                        if not chunk:
+                            break
+                        codec += chunk
+                    if len(meta) != 64 or len(codec) != 12:
+                        raise RuntimeError("scrcpy 视频握手数据不完整（meta=%d, codec=%d）" % (len(meta), len(codec)))
+                    self.encoded_width = struct.unpack(">I", codec[4:8])[0]
+                    self.encoded_height = struct.unpack(">I", codec[8:12])[0]
+                    video.settimeout(None)
+                self.sock = control
+                self.video = video
+                self.width, self.height = device_resolution()
+                return
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                for sock in (control, video):
+                    if sock is not None:
+                        try:
+                            sock.close()
+                        except OSError:
+                            pass
+                time.sleep(0.8)
+                self._adb_locked(["forward", "--remove", "tcp:%d" % SCRCPY_PORT], timeout=8)
+                self._adb_locked(["forward", "tcp:%d" % SCRCPY_PORT, "localabstract:scrcpy"], timeout=8)
+        raise RuntimeError("scrcpy 握手失败：%s" % last_exc)
+
+    def read_video_packet(self):
+        """从 scrcpy 视频通道读一个包：返回 (is_config, payload) 或 None。"""
+        video = self.video
+        if video is None:
+            return None
+        header = b""
+        while len(header) < 12:
+            chunk = video.recv(12 - len(header))
             if not chunk:
-                break
-            meta += chunk
-        self.sock = sock
-        self.width, self.height = device_resolution()
+                return None
+            header += chunk
+        pts_flags, size = struct.unpack(">QI", header)
+        payload = b""
+        while len(payload) < size:
+            chunk = video.recv(size - len(payload))
+            if not chunk:
+                return None
+            payload += chunk
+        return bool((pts_flags >> 63) & 1), payload
 
     def _close_locked(self):
-        if self.sock is not None:
-            try:
-                self.sock.close()
-            except OSError:
-                pass
-            self.sock = None
+        for sock in (self.sock, self.video):
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+        self.sock = None
+        self.video = None
+
+    def reset(self):
+        """断开当前通道（视频管线出错时调用，下一次 ensure() 会重建）。"""
+        with self.lock:
+            self._close_locked()
 
     def _write(self, payload):
         if self.sock is None:
@@ -504,6 +580,51 @@ class FrameHub:
             self._publish(buf[start:end + 2])
             buf = buf[end + 2:]
 
+    def _pipeline_scrcpy(self):
+        """scrcpy 视频流（H.264，30fps 上限）→ ffmpeg 转 MJPEG。
+
+        相比截图轮询省掉一次 framebuffer 回读，实测「输入→首帧」约 50~200ms。
+        """
+        if not INJECTOR.ready:
+            if not INJECTOR.ensure():
+                raise RuntimeError("scrcpy 通道未就绪：%s" % INJECTOR.last_error)
+        if INJECTOR.video is None:
+            raise RuntimeError("scrcpy 视频通道不可用")
+        ff = subprocess.Popen(
+            [FFMPEG, "-hide_banner", "-loglevel", "error",
+             "-f", "h264", "-i", "pipe:0", "-an",
+             "-vf", "scale=%d:-2" % STREAM_W,
+             "-q:v", str(STREAM_Q), "-flush_packets", "1", "-f", "mjpeg", "pipe:1"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+
+        def feed():
+            try:
+                while self.running:
+                    packet = INJECTOR.read_video_packet()
+                    if packet is None:
+                        break
+                    _, payload = packet
+                    ff.stdin.write(payload)
+                    ff.stdin.flush()
+            except Exception:  # noqa: BLE001
+                pass
+            finally:
+                try:
+                    ff.stdin.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        threading.Thread(target=feed, daemon=True).start()
+        try:
+            self._read_mjpeg(ff.stdout)
+        finally:
+            try:
+                ff.kill()
+            except OSError:
+                pass
+            INJECTOR.reset()
+
     def _poll_worker(self):
         """raw 截图轮询：每帧都是「当前屏幕」的即时截图，没有编码器排队延迟。"""
         while self.running:
@@ -536,10 +657,28 @@ class FrameHub:
     def _supervise(self):
         self.running = True
         try:
-            if HAS_PIL:
+            if SCRCPY_VIDEO and shutil.which(FFMPEG):
+                while self.running:
+                    if self.stop_at and time.time() > self.stop_at:
+                        break
+                    try:
+                        self.mode = "scrcpy"
+                        started = time.time()
+                        self._pipeline_scrcpy()
+                        if time.time() - started < 3:
+                            raise RuntimeError("scrcpy 视频管线很快退出")
+                    except Exception as exc:  # noqa: BLE001
+                        self._set_error("scrcpy 视频不可用，回退截图轮询：%s" % exc)
+                        INJECTOR.reset()
+                        self.mode = "poll"
+                        self._supervise_poll()
+                        break
+                    if not self.running:
+                        break
+            elif HAS_PIL:
                 self._supervise_poll()
             else:
-                self._seed_frame()  # 无 Pillow 时退回 ffmpeg 管线，先给一帧静态画面
+                self._seed_frame()  # 没有 Pillow/ffmpeg 时退回 screenrecord 管线，先给一帧静态画面
                 while self.running:
                     if self.stop_at and time.time() > self.stop_at:
                         break
@@ -585,14 +724,22 @@ class FrameHub:
         with self.cond:
             self.clients += 1
         self._start()
-        # 管线可能还在（最后一个客户端断开后保留 15 秒），此时 HUB 里可能是旧画面；
-        # 屏幕静止时 screenrecord 也不会产新帧，所以给新客户端补一张当前截图。
-        if self.running and (time.time() - self.last_publish > 2):
+        # scrcpy 视频 / screenrecord 都只在画面变化时出帧：新客户端接入时先补一张
+        # 当前截图当首帧（轮询模式下很快会有新帧，这一次补帧会被跳过）。
+        if HAS_PIL:
+            threading.Thread(target=self._seed_after_attach, daemon=True).start()
+        elif self.running and (time.time() - self.last_publish > 2):
             threading.Thread(target=self._refresh_seed, daemon=True).start()
 
+    def _seed_after_attach(self):
+        time.sleep(0.35)
+        if time.time() - self.last_publish < 0.6:
+            return
+        self._seed_frame()
+
     def _refresh_seed(self):
-        if self.mode == "poll":
-            return  # 轮询模式下每帧都是最新截图，无需补帧
+        if self.mode in ("poll", "scrcpy"):
+            return  # 轮询/视频流模式下画面自己会更新，无需补帧
         if not self.seed_lock.acquire(blocking=False):
             return
         try:
@@ -607,8 +754,8 @@ class FrameHub:
 
         轮询模式（默认）每帧都是即时截图，不需要补帧；只有退回 ffmpeg 管线时才补。
         """
-        if self.mode == "poll":
-            return
+        if self.mode in ("poll", "scrcpy"):
+            return  # 轮询/视频流模式画面持续更新，不需要补帧
         injected_at = time.time()
         with self.lock:
             if injected_at - self.last_refresh < 0.25:
