@@ -111,6 +111,10 @@ h1 {
   background: #000;
 }
 
+.frame[hidden] {
+  display: none;
+}
+
 .boot {
   position: absolute;
   inset: 0;

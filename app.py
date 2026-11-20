@@ -22,10 +22,14 @@
 启动：python app.py  →  http://127.0.0.1:8150
 """
 
+import base64
+import collections
+import hashlib
 import io
 import json
 import os
 import re
+import select
 import shutil
 import socket
 import struct
@@ -287,7 +291,7 @@ class ScrcpyInjector:
             "CLASSPATH=%s app_process / com.genymobile.scrcpy.Server 2.4 "
             "log_level=error video=%s audio=false control=true tunnel_forward=true "
             "send_device_meta=true send_codec_meta=%s send_frame_meta=%s send_dummy_byte=true "
-            "cleanup=false max_fps=30 video_bit_rate=%d "
+            "cleanup=false max_fps=30 video_bit_rate=%d video_codec_options=i-frame-interval:int=1 "
             ">/data/local/tmp/scrcpy.log 2>&1 &"
             % (DEVICE_JAR, video_arg, codec_meta, frame_meta, SCRCPY_VIDEO_BITRATE)
         )
@@ -345,11 +349,21 @@ class ScrcpyInjector:
                 self._adb_locked(["forward", "tcp:%d" % SCRCPY_PORT, "localabstract:scrcpy"], timeout=8)
         raise RuntimeError("scrcpy 握手失败：%s" % last_exc)
 
-    def read_video_packet(self):
-        """从 scrcpy 视频通道读一个包：返回 (is_config, payload) 或 None。"""
+    def read_video_packet(self, timeout=1.0):
+        """从 scrcpy 视频通道读一个包。
+
+        返回 (flags, payload)、``"timeout"``（等待超时，可用来检查退出标志）或 None（通道关闭）。
+        flags：bit0=配置包（SPS/PPS），bit1=关键帧。
+        """
         video = self.video
         if video is None:
             return None
+        try:
+            ready, _, _ = select.select([video], [], [], timeout)
+        except (OSError, ValueError):
+            return None
+        if not ready:
+            return "timeout"
         header = b""
         while len(header) < 12:
             chunk = video.recv(12 - len(header))
@@ -363,7 +377,12 @@ class ScrcpyInjector:
             if not chunk:
                 return None
             payload += chunk
-        return bool((pts_flags >> 63) & 1), payload
+        flags = 0
+        if (pts_flags >> 63) & 1:
+            flags |= 1
+        if (pts_flags >> 62) & 1:
+            flags |= 2
+        return flags, payload
 
     def _close_locked(self):
         for sock in (self.sock, self.video):
@@ -431,6 +450,160 @@ class ScrcpyInjector:
 INJECTOR = ScrcpyInjector()
 
 
+# ------------------------------------------------------- WebSocket 视频（WebCodecs）
+
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def ws_accept_key(key):
+    return base64.b64encode(hashlib.sha1((key + WS_GUID).encode("ascii")).digest()).decode("ascii")
+
+
+def ws_read_frame(rfile):
+    """读一个客户端 WebSocket 帧，返回 (opcode, payload)；连接结束返回 (None, b"")。"""
+    head = rfile.read(2)
+    if not head or len(head) < 2:
+        return None, b""
+    b1, b2 = head[0], head[1]
+    opcode = b1 & 0x0F
+    masked = b2 & 0x80
+    length = b2 & 0x7F
+    if length == 126:
+        ext = rfile.read(2)
+        if len(ext) < 2:
+            return None, b""
+        length = struct.unpack(">H", ext)[0]
+    elif length == 127:
+        ext = rfile.read(8)
+        if len(ext) < 8:
+            return None, b""
+        length = struct.unpack(">Q", ext)[0]
+    if length > 1000000:
+        return None, b""
+    mask = rfile.read(4) if masked else b""
+    payload = rfile.read(length) if length else b""
+    if masked and len(mask) == 4:
+        payload = bytes(payload[i] ^ mask[i % 4] for i in range(len(payload)))
+    return opcode, payload
+
+
+def ws_send_frame(sock, opcode, payload):
+    header = bytearray([0x80 | opcode])
+    n = len(payload)
+    if n < 126:
+        header.append(n)
+    elif n < 65536:
+        header.append(126)
+        header.extend(struct.pack(">H", n))
+    else:
+        header.append(127)
+        header.extend(struct.pack(">Q", n))
+    sock.sendall(bytes(header) + payload)
+
+
+class WSClient:
+    """一个 WebSocket 视频客户端：有界队列 + 独立写线程（队列满时丢最旧帧）。"""
+
+    def __init__(self, sock):
+        self.sock = sock
+        self.queue = collections.deque(maxlen=6)
+        self.cond = threading.Condition()
+        self.alive = True
+        self.thread = threading.Thread(target=self._writer, daemon=True)
+        self.thread.start()
+
+    def enqueue(self, flags, payload):
+        with self.cond:
+            if not self.alive:
+                return
+            self.queue.append(bytes([flags & 0x03]) + payload)
+            self.cond.notify()
+
+    def _writer(self):
+        try:
+            while True:
+                with self.cond:
+                    while self.alive and not self.queue:
+                        self.cond.wait(0.5)
+                    if not self.alive:
+                        return
+                    data = self.queue.popleft()
+                ws_send_frame(self.sock, 0x2, data)
+        except (OSError, ValueError):
+            self.alive = False
+
+    def close(self):
+        with self.cond:
+            self.alive = False
+            self.cond.notify_all()
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+class WSVideoHub:
+    """把 scrcpy H.264 包广播给 WebCodecs 客户端，并缓存配置包 / 关键帧给新客户端。"""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.clients = []
+        self.config_packet = None
+        self.last_keyframe = None
+        self.last_keyframe_at = 0.0
+        self.last_packet_at = 0.0
+        self.sent_frames = 0
+
+    @property
+    def client_count(self):
+        with self.lock:
+            return len(self.clients)
+
+    def has_fresh_keyframe(self, max_age=2.0):
+        with self.lock:
+            if self.last_keyframe is None:
+                return False
+            # 关键帧够新；或屏幕一直静止（之后没有新包）→ 旧关键帧仍是当前画面
+            return (
+                time.time() - self.last_keyframe_at < max_age
+                or time.time() - self.last_packet_at > max_age
+            )
+
+    def add(self, client):
+        with self.lock:
+            self.clients.append(client)
+            backlog = []
+            if self.config_packet is not None:
+                backlog.append((1, self.config_packet))
+            # 缓存的关键帧即使旧也能先解出一张静态图（等后续关键帧再刷新），
+            # 保证新客户端立刻有画面，而不是等下一次屏幕变化。
+            if self.last_keyframe is not None:
+                backlog.append((2, self.last_keyframe))
+        for flags, payload in backlog:
+            client.enqueue(flags, payload)
+
+    def remove(self, client):
+        with self.lock:
+            if client in self.clients:
+                self.clients.remove(client)
+
+    def broadcast(self, flags, payload):
+        with self.lock:
+            if flags & 1:
+                self.config_packet = payload
+            if flags & 2:
+                self.last_keyframe = payload
+                self.last_keyframe_at = time.time()
+            self.last_packet_at = time.time()
+            clients = list(self.clients)
+            self.sent_frames += len(clients)
+        for client in clients:
+            client.enqueue(flags, payload)
+
+
+WSVIDEO = WSVideoHub()
+
+
 # ------------------------------------------------------------------ 画面流
 
 
@@ -446,8 +619,9 @@ class FrameHub:
         self.frame = None
         self.seq = 0
         self.clients = 0
+        self.ws_clients = 0
         self.running = False
-        self.mode = ""  # screenrecord / screencap
+        self.mode = ""  # screenrecord / screencap / scrcpy / poll
         self.error = ""
         self.stop_at = 0.0
         self.thread = None
@@ -455,6 +629,7 @@ class FrameHub:
         self.seed_lock = threading.Lock()
         self.last_publish = 0.0
         self.last_refresh = 0.0
+        self.restart_requested = False
 
     # ---- 采集线程 ----
 
@@ -583,7 +758,8 @@ class FrameHub:
     def _pipeline_scrcpy(self):
         """scrcpy 视频流（H.264，30fps 上限）→ ffmpeg 转 MJPEG。
 
-        相比截图轮询省掉一次 framebuffer 回读，实测「输入→首帧」约 50~200ms。
+        同时把原始 H.264 包广播给 WebSocket 客户端（浏览器 WebCodecs 直接解码，
+        去掉服务端转码这一跳，端到端 ~10~80ms）。
         """
         if not INJECTOR.ready:
             if not INJECTOR.ensure():
@@ -601,12 +777,20 @@ class FrameHub:
         def feed():
             try:
                 while self.running:
+                    if self.restart_requested:
+                        break
                     packet = INJECTOR.read_video_packet()
                     if packet is None:
                         break
-                    _, payload = packet
-                    ff.stdin.write(payload)
-                    ff.stdin.flush()
+                    if packet == "timeout":
+                        continue
+                    flags, payload = packet
+                    WSVIDEO.broadcast(flags, payload)
+                    try:
+                        ff.stdin.write(payload)
+                        ff.stdin.flush()
+                    except (OSError, ValueError):
+                        break
             except Exception:  # noqa: BLE001
                 pass
             finally:
@@ -665,6 +849,12 @@ class FrameHub:
                         self.mode = "scrcpy"
                         started = time.time()
                         self._pipeline_scrcpy()
+                        if self.restart_requested:
+                            # 新客户端没有关键帧：重建编码器，让它重新吐 config+关键帧
+                            self.restart_requested = False
+                            INJECTOR.reset()
+                            time.sleep(0.2)
+                            continue
                         if time.time() - started < 3:
                             raise RuntimeError("scrcpy 视频管线很快退出")
                     except Exception as exc:  # noqa: BLE001
@@ -712,11 +902,26 @@ class FrameHub:
 
     def _stop_later(self):
         with self.lock:
-            if self.clients > 0:
+            if self.clients > 0 or self.ws_clients > 0:
                 return
             if not self.running:
                 return
             self.stop_at = time.time() + 15
+
+    def attach_ws(self):
+        """WebCodecs 客户端接入：也要保证采流管线在跑。"""
+        with self.cond:
+            self.ws_clients += 1
+        self._start()
+
+    def request_restart(self):
+        """请求重建 scrcpy 视频通道（新客户端没有可用关键帧时，强制编码器输出关键帧）。"""
+        self.restart_requested = True
+
+    def detach_ws(self):
+        with self.cond:
+            self.ws_clients = max(0, self.ws_clients - 1)
+        self._stop_later()
 
     # ---- 客户端接口 ----
 
@@ -793,6 +998,8 @@ class FrameHub:
         with self.cond:
             return {
                 "clients": self.clients,
+                "ws_clients": self.ws_clients,
+                "ws_sent": WSVIDEO.sent_frames,
                 "streaming": self.running,
                 "mode": self.mode,
                 "error": self.error,
@@ -861,6 +1068,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(204, b"", "image/x-icon", head_only)
         if path == "/stream.mjpg":
             return self._stream()
+        if path == "/api/snapshot":
+            return self._snapshot(head_only)
+        if path == "/ws/video":
+            return self._ws_video()
         if path == "/api/health":
             return self._json(200, {
                 "ok": True, "service": "android-box",
@@ -917,6 +1128,61 @@ class Handler(BaseHTTPRequestHandler):
                 "booted": device_prop("sys.boot_completed") == "1",
             })
         self._json(200, payload, head_only)
+
+    # ---- 快照（WebCodecs 首帧占位） ----
+
+    def _snapshot(self, head_only=False):
+        jpeg = capture_jpeg_raw() if HAS_PIL else None
+        if jpeg is None:
+            return self._error(503, "截图不可用")
+        self._send(200, jpeg, "image/jpeg", head_only)
+
+    # ---- WebSocket 视频（浏览器 WebCodecs 直接解码） ----
+
+    def _ws_video(self):
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        upgrade = (self.headers.get("Upgrade", "") or "").lower()
+        if upgrade != "websocket" or not key:
+            return self._error(400, "需要 WebSocket 升级")
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", ws_accept_key(key))
+        self.end_headers()
+        try:
+            self.wfile.flush()
+        except OSError:
+            return
+        client = WSClient(self.connection)
+        WSVIDEO.add(client)
+        HUB.attach_ws()
+        # 管线本来就没在跑时，新起编码器会直接给 config+关键帧，不需要重建；
+        # 只有「正在直播但没有可用关键帧」才重建编码器强刷一个关键帧。
+        if HUB.running and not WSVIDEO.has_fresh_keyframe():
+            HUB.request_restart()
+        try:
+            while True:
+                opcode, payload = ws_read_frame(self.rfile)
+                if opcode is None:
+                    break
+                if opcode == 0x8:  # close
+                    try:
+                        ws_send_frame(self.connection, 0x8, b"")
+                    except OSError:
+                        pass
+                    break
+                if opcode == 0x9:  # ping → pong
+                    try:
+                        ws_send_frame(self.connection, 0xA, payload)
+                    except OSError:
+                        break
+        except OSError:
+            pass
+        finally:
+            WSVIDEO.remove(client)
+            client.close()
+            HUB.detach_ws()
+            self.close_connection = True
 
     # ---- MJPEG 流 ----
 

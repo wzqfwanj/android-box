@@ -16,10 +16,20 @@
 
   var state = {
     device: null,
-    attached: false,
+    renderer: null, // "ws"（WebCodecs 直连） / "mjpeg" / null
+    ws: null,
+    decoder: null,
+    wsConfig: null,
+    frameTs: 0,
+    lastFrameAt: 0,
+    wsFrames: 0,
+    decodeErrors: 0,
+    lastError: "",
     ratio: "9 / 16",
     lastTapAt: 0,
   };
+  // 便于线上诊断（只读状态，不影响功能）
+  window.__androidBox = state;
 
   var toastTimer = 0;
 
@@ -74,25 +84,199 @@
 
   // ---------------------------------------------------------- 画面流
 
-  function attachStream() {
+  // 优先：WebSocket 收 scrcpy 的 H.264 裸流，浏览器用 WebCodecs 直接解码
+  // （去掉服务端 ffmpeg 转码这一跳，端到端约 10~80ms）。
+  // 回退：同源 MJPEG <img>（老浏览器 / 解码器初始化失败时）。
+
+  function supportsWebCodecs() {
+    return typeof window.VideoDecoder === "function" && typeof window.WebSocket === "function";
+  }
+
+  function wsVideoUrl() {
+    var proto = location.protocol === "https:" ? "wss:" : "ws:";
+    var dir = location.pathname.replace(/[^/]*$/, "");
+    return proto + "//" + location.host + dir + "ws/video";
+  }
+
+  function concatBytes(a, b) {
+    var out = new Uint8Array(a.length + b.length);
+    out.set(a, 0);
+    out.set(b, a.length);
+    return out;
+  }
+
+  function hideBoot() {
+    var boot = $("#boot");
+    if (boot && !boot.classList.contains("is-hidden")) boot.classList.add("is-hidden");
+  }
+
+  function startWebCodecs() {
+    if (state.renderer) return;
+    var canvas = $("#screenCanvas");
     var img = $("#frame");
+    if (!canvas || !img) return;
+    var ctx = canvas.getContext("2d", { alpha: false });
+    var decoder;
+    try {
+      decoder = new VideoDecoder({
+        output: function (frame) {
+          try {
+            if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+              canvas.width = frame.displayWidth;
+              canvas.height = frame.displayHeight;
+            }
+            ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+          } catch (err) {
+            /* 单帧绘制失败忽略 */
+          }
+          frame.close();
+          hideBoot();
+          state.lastFrameAt = Date.now();
+        },
+        error: function (err) {
+          state.decodeErrors += 1;
+          state.lastError = err && err.message ? err.message : String(err);
+          toast("视频解码失败：" + state.lastError);
+          fallbackToMjpeg();
+        },
+      });
+      // Annex-B 裸流：不传 description，SPS/PPS 随配置包在带内发送
+      decoder.configure({ codec: "avc1.42E01E", optimizeForLatency: true });
+    } catch (err) {
+      attachMjpeg();
+      return;
+    }
+
+    var ws;
+    try {
+      ws = new WebSocket(wsVideoUrl());
+    } catch (err) {
+      try {
+        decoder.close();
+      } catch (err2) {
+        /* ignore */
+      }
+      attachMjpeg();
+      return;
+    }
+    ws.binaryType = "arraybuffer";
+    state.renderer = "ws";
+    state.ws = ws;
+    state.decoder = decoder;
+    state.wsConfig = null;
+    state.frameTs = 0;
+    canvas.hidden = false;
+    img.hidden = true;
+
+    // 首帧占位：编码器关键帧可能还要等一会儿，先用一张截图把画面显示出来
+    var snapshot = new Image();
+    snapshot.onload = function () {
+      if (state.renderer !== "ws") return;
+      try {
+        canvas.width = snapshot.naturalWidth || 480;
+        canvas.height = snapshot.naturalHeight || 854;
+        ctx.drawImage(snapshot, 0, 0, canvas.width, canvas.height);
+        hideBoot();
+      } catch (err) {
+        /* ignore */
+      }
+    };
+    snapshot.src = "api/snapshot?ts=" + Date.now();
+
+    ws.onmessage = function (event) {
+      if (!(event.data instanceof ArrayBuffer)) return;
+      state.wsFrames += 1;
+      var bytes = new Uint8Array(event.data);
+      if (bytes.length < 2) return;
+      var flags = bytes[0];
+      var payload = bytes.subarray(1);
+      if (flags & 1) {
+        // 配置包（SPS/PPS）：拼到下一帧前面一起喂给解码器
+        state.wsConfig = payload;
+        return;
+      }
+      var type = (flags & 2) ? "key" : "delta";
+      var data = payload;
+      if (state.wsConfig) {
+        data = concatBytes(state.wsConfig, payload);
+        state.wsConfig = null;
+        type = "key";
+      }
+      state.frameTs += 33;
+      try {
+        state.decoder.decode(new EncodedVideoChunk({
+          type: type,
+          timestamp: state.frameTs,
+          data: data,
+        }));
+      } catch (err) {
+        fallbackToMjpeg();
+      }
+    };
+    ws.onerror = function () {
+      fallbackToMjpeg();
+    };
+    ws.onclose = function () {
+      if (!document.hidden && state.renderer === "ws") fallbackToMjpeg();
+    };
+  }
+
+  function attachMjpeg() {
+    var img = $("#frame");
+    var canvas = $("#screenCanvas");
     if (!img) return;
-    state.attached = true;
+    if (canvas) canvas.hidden = true;
+    state.renderer = "mjpeg";
+    img.hidden = false;
     img.src = "stream.mjpg?ts=" + Date.now();
     img.onerror = function () {
       if (document.hidden) return;
       setStatus("画面流断开，2 秒后重连…");
       setTimeout(function () {
-        if (!document.hidden) attachStream();
+        if (!document.hidden && state.renderer === "mjpeg") attachMjpeg();
       }, 2000);
     };
   }
 
-  function detachStream() {
+  function fallbackToMjpeg() {
+    stopStream();
+    attachMjpeg();
+  }
+
+  function stopStream() {
+    state.renderer = null;
+    if (state.ws) {
+      try {
+        state.ws.close();
+      } catch (err) {
+        /* ignore */
+      }
+      state.ws = null;
+    }
+    if (state.decoder) {
+      try {
+        state.decoder.close();
+      } catch (err) {
+        /* ignore */
+      }
+      state.decoder = null;
+    }
+    state.wsConfig = null;
     var img = $("#frame");
-    if (!img) return;
-    state.attached = false;
-    img.removeAttribute("src");
+    if (img) {
+      img.onerror = null;
+      img.removeAttribute("src");
+    }
+  }
+
+  function attachStream() {
+    if (state.renderer) return;
+    if (supportsWebCodecs()) startWebCodecs();
+    else attachMjpeg();
+  }
+
+  function detachStream() {
+    stopStream();
   }
 
   // ---------------------------------------------------------- 触摸映射
@@ -202,13 +386,14 @@
     parts.push(res.width + "×" + res.height);
     if (!device.booted) parts.push("系统启动中…");
     if (stream.streaming) parts.push("画面 " + (stream.mode === "screencap" ? "逐帧" : "实时"));
+    if (state.renderer === "ws") parts.push("视频直连");
     if (stream.error) parts.push(stream.error);
     setStatus(parts.join(" · "));
 
     if (device.booted) {
       var boot = $("#boot");
       if (boot && !boot.classList.contains("is-hidden")) boot.classList.add("is-hidden");
-      if (!state.attached && !document.hidden) attachStream();
+      if (!state.renderer && !document.hidden) attachStream();
     }
   }
 

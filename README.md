@@ -27,7 +27,7 @@
 
 | 能力 | 说明 |
 | --- | --- |
-| 实时画面 | 优先走 **scrcpy 视频流**（H.264，30fps 上限）→ `ffmpeg` 转 MJPEG，端到端实测 **~10~150ms**；不可用时自动回退「raw 截图轮询」（`adb screencap` + Pillow，~150~200ms/帧）或 `screenrecord`+`ffmpeg` |
+| 实时画面 | 主通道：scrcpy 视频流（H.264，30fps 上限）经 **WebSocket 直发浏览器，WebCodecs 直接解码**，本机实测 **46~85ms**；老浏览器/解码失败自动回退服务端 `ffmpeg` 转 MJPEG（~100~200ms），再不可用回退「raw 截图轮询」 |
 | 触摸操作 | 点按 = 设备触摸，拖动 = 滑屏；浏览器坐标按设备分辨率换算后经**常驻注入通道**（scrcpy-server）注入真实系统，实测 ~1~4ms（网关往返 ~30~60ms）；通道异常时自动回退 `adb shell input` |
 | 按键控制 | 返回 / 主屏 / 最近任务 / 音量 − / 音量 + / 电源（常驻注入通道，实测 ~30ms） |
 | 低延迟注入 | 内置 `scrcpy-server v2.4`（Apache-2.0，© Genymobile）常驻设备端，避免每次 `adb shell input` 冷启动 Java 进程（实测 700~800ms → ~30ms） |
@@ -43,7 +43,7 @@
 | --- | --- | --- |
 | 设备 | redroid（AOSP Android 11，x86_64）或 Windows 模拟器 | 方案 A：Docker 容器里运行的真实 Android；方案 B：家用 Windows PC 上的硬件加速（WHPX）模拟器 |
 | 后端 | Python 3.12 标准库 + Pillow | `http.server` + `threading` + `subprocess`；Pillow 用系统包 `python3-pil`（apt，不需要 pip、无 requirements） |
-| 画面 | scrcpy 视频流 → ffmpeg（回退 screencap 轮询） | 视频模式 30fps 上限、端到端 ~10~150ms；截图模式 ~150~200ms/帧；统一转 MJPEG 供浏览器 `<img>` |
+| 画面 | scrcpy 视频流（WebCodecs 直解 / ffmpeg 转 MJPEG） | 服务端只把 H.264 包转发给浏览器（`/ws/video`），浏览器 `VideoDecoder` 直接解码到 `<canvas>`；不支持 WebCodecs 时回退 `ffmpeg`→MJPEG；截图轮询作为最后兜底 |
 | 输入 | scrcpy-server 常驻通道（回退 `adb shell input`） | 维护一条到设备的长连接，触摸/按键只写几十字节；服务端自带重连与 jar 自动重推 |
 | 前端 | 原生 HTML + CSS + JavaScript | 零依赖、零构建，无框架、无 CDN、无网络字体 |
 | 部署 | systemd + Docker + Caddy / 家用 PC | 方案 A：`redroid.service` + `android-box.service` + Caddy 子路径反代；方案 B：Windows 上跑模拟器与 android-box，经 SSH 反向隧道接到网关（Caddy 优先 PC、健康检查失败自动回退方案 A） |
@@ -87,9 +87,11 @@ android-box/
 | GET | `/style.css` | 样式表 |
 | GET | `/app.js` | 前端脚本 |
 | GET | `/favicon.svg` | 站点图标 |
-| GET | `/stream.mjpg` | 实时画面：`multipart/x-mixed-replace; boundary=frame` 长连接，每帧一张 JPEG |
+| GET | `/stream.mjpg` | 实时画面（回退通道）：`multipart/x-mixed-replace; boundary=frame` 长连接，每帧一张 JPEG |
+| GET | `/ws/video` | 实时画面（主通道）：WebSocket 二进制帧，`1 字节 flags + H.264 Annex-B`；flags bit0=配置包、bit1=关键帧，浏览器用 WebCodecs 直接解码 |
+| GET | `/api/snapshot` | 当前屏幕截图（JPEG），WebCodecs 首帧占位用 |
 | GET | `/api/health` | 健康检查，返回服务名、时间与运行时长 |
-| GET | `/api/state` | 设备与画面状态：`adb_online`、`serial`、`model`、`android`、`sdk`、`resolution`、`booted`、`stream`（含 `mode` / `error`） |
+| GET | `/api/state` | 设备与画面状态：`adb_online`、`serial`、`model`、`android`、`sdk`、`resolution`、`booted`、`stream`（含 `mode` / `error` / `clients` / `ws_clients` / `ws_sent`） |
 | GET | `/api/apps` | 已安装的第三方应用包名列表 |
 | POST | `/api/input` | 输入注入（JSON），`type` 为 `tap` / `swipe` / `key` / `text` |
 | POST | `/api/install` | 请求体为 APK 二进制（上限 500MB），后端执行 `adb install -r -g` |
@@ -207,8 +209,9 @@ powershell -ExecutionPolicy Bypass -File windows\start-android-box.ps1
 powershell -ExecutionPolicy Bypass -File windows\install-startup.ps1
 ```
 
-实测（Windows 11 / Ryzen 7 6800H）：本机浏览器「操作→画面变化」**11~147ms**（均值 ~53ms），
-经网关输入往返 **31~57ms**；画面 30fps 上限，静止画面不产帧（新客户端接入时自动补一张当前截图）。
+实测（Windows 11 / Ryzen 7 6800H）：本机浏览器「操作→画面变化」**46~85ms**（WebCodecs 直解，均值 ~64ms），
+经网关输入往返 **31~57ms**；画面 30fps 上限，静止画面不产帧（新客户端先显示 `/api/snapshot` 快照，
+并在有需要时重建编码器强刷关键帧）。网关的 WebSocket 由 Caddy 自动透传（实测 `101 Switching Protocols` 正常）。
 PC 睡眠/关机/断网时，Caddy 健康检查（`/api/health`，4s 间隔）会在约 8 秒内把 PC 摘除，
 流量自动回退到方案 A（页面提示为 server 的 redroid）。
 
@@ -217,7 +220,7 @@ PC 睡眠/关机/断网时，Caddy 健康检查（`/api/health`，4s 间隔）�
 - **指令集**：容器是 x86_64 Android。**仅支持 ARM 的 APK 装不上**（`INSTALL_FAILED_NO_MATCHING_ABIS`），
   需要 x86_64 或包含 x86_64 的 universal APK。
 - **性能**：方案 A（2 vCPU / 3.4GB 的 redroid）：截图轮询约 6~8fps，浏览器端「操作→画面变化」实测 ~300~450ms；
-  方案 B（家用 PC + WHPX 模拟器）：scrcpy 视频流（30fps 上限），本机浏览器实测 **~10~150ms**。
+  方案 B（家用 PC + WHPX 模拟器）：scrcpy 视频流 + WebCodecs 直解，本机浏览器实测 **46~85ms**。
   输入注入始终 **<5ms**（常驻通道），点击还有本地即时涟漪反馈（<20ms）。
   可调参数：`SCRCPY_VIDEO`（1 视频流 / 0 截图轮询）、`CAPTURE_WORKERS`、`JPEG_QUALITY`、`STREAM_W`。
 - **系统镜像**：AOSP Android 11，**没有 GApps / Google Play 服务**，依赖 Google 服务的应用无法使用。
