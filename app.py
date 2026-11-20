@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """android-box · 在线真安卓（容器化 Android）后端
 
@@ -68,7 +68,7 @@ SCRCPY_VIDEO_BITRATE = int(os.environ.get("SCRCPY_VIDEO_BITRATE", "4000000"))
 # Ticket 由 tools/cp_ticket.py 用本机 ~/.aliyun/config.json 的 AK 获取（不落仓库）。
 CLOUD_PHONE_INSTANCE = os.environ.get("CLOUD_PHONE_INSTANCE", "")
 CP_REGION = os.environ.get("CP_REGION", "cn-shanghai")
-_CP_TICKET_CACHE = {"at": 0.0, "data": None}
+
 
 # 画面：默认用并行 raw 截图轮询（每帧都是最新截图，延迟稳定 ~200ms）；
 # 没装 Pillow 时自动退回 screenrecord+ffmpeg 的 MJPEG 管线。
@@ -1320,9 +1320,6 @@ class Handler(BaseHTTPRequestHandler):
     def _cp_ticket(self, head_only=False):
         if not CLOUD_PHONE_INSTANCE:
             return self._json(503, {"ok": False, "error": "未配置云手机实例"}, head_only)
-        now = time.time()
-        if _CP_TICKET_CACHE["data"] and now - _CP_TICKET_CACHE["at"] < 30:
-            return self._json(200, _CP_TICKET_CACHE["data"], head_only)
         helper = os.path.join(BASE_DIR, "tools", "cp_ticket.py")
         try:
             proc = subprocess.run(
@@ -1335,7 +1332,6 @@ class Handler(BaseHTTPRequestHandler):
         if not data.get("ticket"):
             return self._json(502, {"ok": False, "error": data.get("error") or "没有 Ticket"}, head_only)
         data["ok"] = True
-        _CP_TICKET_CACHE.update({"at": now, "data": data})
         return self._json(200, data, head_only)
 
     def _cp_static(self, path, head_only=False):

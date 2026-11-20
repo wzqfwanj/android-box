@@ -55,7 +55,7 @@
     }
     setStatus("获取连接凭证…");
     setBootNote("获取连接凭证 — 云端串流");
-    api("/api/cp/ticket")
+    api("../api/cp/ticket")
       .then(function (data) {
         if (!data.ok || !data.ticket) {
           setStatus("云手机暂不可用：" + (data.error || "没有 Ticket"));
