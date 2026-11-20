@@ -26,6 +26,8 @@ import json
 import os
 import re
 import shutil
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -46,6 +48,12 @@ ADB = os.environ.get("ADB_BIN", "adb")
 FFMPEG = os.environ.get("FFMPEG_BIN", "ffmpeg")
 MAX_UPLOAD = 500 * 1024 * 1024  # APK 上限 500MB
 START_TIME = time.time()
+
+# 低延迟输入注入：预置 scrcpy-server（Apache-2.0, © Genymobile）常驻在设备里，
+# 通过本地 socket 发送注入指令，避免每次 adb shell input 都冷启动 Java 进程（~700ms → ~30ms）
+SCRCPY_JAR = os.path.join(BASE_DIR, "assets", "scrcpy-server-v2.4")
+DEVICE_JAR = "/data/local/tmp/scrcpy-server.jar"
+SCRCPY_PORT = int(os.environ.get("SCRCPY_PORT", "27183"))
 
 try:
     from zoneinfo import ZoneInfo
@@ -72,6 +80,24 @@ KEY_EVENTS = {
     "ENTER": "KEYCODE_ENTER",
     "MENU": "KEYCODE_MENU",
 }
+
+# 同名按键对应的 Android keycode（scrcpy 注入通道用）
+KEYCODES = {
+    "BACK": 4,
+    "HOME": 3,
+    "APP_SWITCH": 187,
+    "POWER": 26,
+    "VOLUME_UP": 24,
+    "VOLUME_DOWN": 25,
+    "ENTER": 66,
+    "MENU": 82,
+}
+
+# MotionEvent 常量
+ACTION_DOWN = 0
+ACTION_UP = 1
+ACTION_MOVE = 2
+BUTTON_PRIMARY = 1
 
 ADB_LOCK = threading.Lock()
 
@@ -132,6 +158,141 @@ def third_party_packages():
     if rc != 0:
         return []
     return sorted(line.split(":", 1)[1] for line in out.splitlines() if ":" in line)
+
+
+# ------------------------------------------------------------------ 低延迟注入
+
+
+class ScrcpyInjector:
+    """常驻注入通道：一次启动 scrcpy-server，之后每次触摸/按键只写几十字节。
+
+    对比 `adb shell input`：后者每次都要冷启动一个 Java 进程（本机实测 700~800ms），
+    常驻通道实测 ~30ms。
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.sock = None
+        self.width, self.height = 480, 854
+        self.last_error = ""
+
+    @property
+    def ready(self):
+        return self.sock is not None
+
+    def ensure(self):
+        with self.lock:
+            if self.sock is not None:
+                return True
+            try:
+                self._setup_locked()
+                self.last_error = ""
+                return True
+            except Exception as exc:  # noqa: BLE001
+                self.last_error = str(exc)
+                self._close_locked()
+                return False
+
+    def _adb_locked(self, args, timeout=20):
+        with ADB_LOCK:
+            return adb(args, timeout=timeout)
+
+    def _setup_locked(self):
+        # 1) 设备上没有 jar 就推送（容器重建后 /data/local/tmp 会清空）
+        rc, _, _ = self._adb_locked(["shell", "test", "-f", DEVICE_JAR], timeout=8)
+        if rc != 0:
+            if not os.path.exists(SCRCPY_JAR):
+                raise RuntimeError("缺少 scrcpy-server：%s" % SCRCPY_JAR)
+            rc, _, err = self._adb_locked(["push", SCRCPY_JAR, DEVICE_JAR], timeout=60)
+            if rc != 0:
+                raise RuntimeError("推送 scrcpy-server 失败：%s" % err)
+
+        # 2) 重启注入服务
+        self._adb_locked(["shell", "pkill", "-f", "com.genymobile.scrcpy.Server"], timeout=8)
+        time.sleep(0.2)
+        cmd = (
+            "CLASSPATH=%s app_process / com.genymobile.scrcpy.Server 2.4 "
+            "log_level=error video=false audio=false control=true tunnel_forward=true "
+            "send_device_meta=true send_dummy_byte=true cleanup=false "
+            ">/data/local/tmp/scrcpy.log 2>&1 &" % DEVICE_JAR
+        )
+        self._adb_locked(["shell", cmd], timeout=10)
+        time.sleep(1.2)
+
+        # 3) adb forward + 握手（1 字节 dummy + 64 字节设备名）
+        self._adb_locked(["forward", "tcp:%d" % SCRCPY_PORT, "localabstract:scrcpy"], timeout=8)
+        sock = socket.create_connection(("127.0.0.1", SCRCPY_PORT), timeout=6)
+        sock.settimeout(6)
+        dummy = sock.recv(1)
+        if dummy != b"\x00":
+            sock.close()
+            raise RuntimeError("scrcpy 握手失败（dummy=%r）" % dummy)
+        meta = b""
+        while len(meta) < 64:
+            chunk = sock.recv(64 - len(meta))
+            if not chunk:
+                break
+            meta += chunk
+        self.sock = sock
+        self.width, self.height = device_resolution()
+
+    def _close_locked(self):
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+
+    def _write(self, payload):
+        if self.sock is None:
+            raise RuntimeError("注入通道未就绪")
+        try:
+            self.sock.sendall(payload)
+        except OSError:
+            self._close_locked()
+            raise
+
+    def _touch(self, action, x, y):
+        pressure = 0xFFFF if action != ACTION_UP else 0
+        action_button = BUTTON_PRIMARY if action == ACTION_DOWN else 0
+        buttons = 0 if action == ACTION_UP else BUTTON_PRIMARY
+        self._write(struct.pack(
+            ">BBqiiHHHii", 2, action, 0x12345678, int(x), int(y),
+            self.width, self.height, pressure, action_button, buttons,
+        ))
+
+    def tap(self, x, y):
+        with self.lock:
+            self._touch(ACTION_DOWN, x, y)
+            self._touch(ACTION_UP, x, y)
+
+    def swipe(self, x1, y1, x2, y2, duration):
+        with self.lock:
+            steps = max(3, min(24, int(duration / 40)))
+            self._touch(ACTION_DOWN, x1, y1)
+            for i in range(1, steps + 1):
+                x = x1 + (x2 - x1) * i / steps
+                y = y1 + (y2 - y1) * i / steps
+                time.sleep(max(0.008, duration / 1000.0 / steps))
+                self._touch(ACTION_MOVE, int(x), int(y))
+            self._touch(ACTION_UP, x2, y2)
+
+    def key(self, name):
+        keycode = KEYCODES.get(name.upper())
+        if keycode is None:
+            raise ValueError("不支持的按键")
+        with self.lock:
+            self._write(struct.pack(">BBiii", 0, ACTION_DOWN, keycode, 0, 0))
+            self._write(struct.pack(">BBiii", 0, ACTION_UP, keycode, 0, 0))
+
+    def text(self, text):
+        data = text.encode("utf-8")
+        with self.lock:
+            self._write(struct.pack(">BI", 1, len(data)) + data)
+
+
+INJECTOR = ScrcpyInjector()
 
 
 # ------------------------------------------------------------------ 画面流
@@ -341,24 +502,28 @@ class FrameHub:
         finally:
             self.seed_lock.release()
 
-    def request_refresh(self, delays=(0.8, 2.0)):
-        """输入注入后补「操作完成后的最终画面」。
+    def request_refresh(self):
+        """输入注入后按需补「操作完成后的最终画面」。
 
-        screenrecord 只在画面变化时出帧，动画结束时的那一帧经常抓不到，
-        浏览器就会停在动画中间。这里在输入后分两次截图（动画中 + 动画后），
-        保证最终状态准确。
+        screenrecord 只在画面变化时出帧，动画结束那一帧经常抓不到；但每次输入都
+        强制截图又会把画面延迟拉高（screencap 单次要 ~0.5s）。所以只在「注入后
+        确实没有新帧」时才补截图，避免覆盖正在播放的动画帧。
         """
-        now = time.time()
+        injected_at = time.time()
         with self.lock:
-            if now - self.last_refresh < 0.6:
+            if injected_at - self.last_refresh < 0.25:
                 return
-            self.last_refresh = now
+            self.last_refresh = injected_at
 
         def run():
-            previous = 0.0
-            for delay in delays:
-                time.sleep(max(0.05, delay - previous))
-                previous = delay
+            time.sleep(0.35)
+            if self.last_publish < injected_at:
+                with self.seed_lock:
+                    self._seed_frame()
+            baseline = time.time()
+            time.sleep(0.9)
+            # 动画已结束且之后没有新帧 → 补一张最终状态
+            if self.last_publish < baseline:
                 with self.seed_lock:
                     self._seed_frame()
 
@@ -550,35 +715,61 @@ class Handler(BaseHTTPRequestHandler):
         if err:
             return self._error(400, err)
         kind = payload.get("type")
-        if kind == "tap":
-            x, y = int(payload.get("x", 0)), int(payload.get("y", 0))
-            rc, _, err = adb_shell(["input", "tap", str(x), str(y)], timeout=15)
-        elif kind == "swipe":
-            args = [str(int(payload.get(k, 0))) for k in ("x1", "y1", "x2", "y2")]
-            duration = max(50, min(3000, int(payload.get("duration", 200))))
-            rc, _, err = adb_shell(["input", "swipe"] + args + [str(duration)], timeout=20)
-        elif kind == "key":
-            key = KEY_EVENTS.get(str(payload.get("key", "")).upper())
-            if not key:
+        if kind not in ("tap", "swipe", "key", "text"):
+            return self._error(400, "未知输入类型")
+
+        # 参数校验（两种注入通道共用）
+        if kind == "key":
+            key_name = str(payload.get("key", "")).upper()
+            if key_name not in KEYCODES:
                 return self._error(400, "不支持的按键")
-            rc, _, err = adb_shell(["input", "keyevent", key], timeout=15)
-        elif kind == "text":
+        if kind == "text":
             text = str(payload.get("text", ""))
             if not text or len(text) > 200:
                 return self._error(400, "文字长度需在 1~200 之间")
-            # adb input text 只支持 ASCII，空格用 %s 转义
-            safe = "".join(ch if 32 <= ord(ch) < 127 else "" for ch in text)
-            safe = safe.replace(" ", "%s")
-            if not safe:
+            # scrcpy / adb 都只支持 ASCII；中文请用设备软键盘
+            safe_text = "".join(ch if 32 <= ord(ch) < 127 else "" for ch in text)
+            if not safe_text:
                 return self._error(400, "仅支持 ASCII 文字输入（中文请用设备软键盘）")
-            rc, _, err = adb_shell(["input", "text", safe], timeout=15)
-        else:
-            return self._error(400, "未知输入类型")
-        if rc != 0:
-            return self._error(502, "注入失败：%s" % err)
+        if kind == "swipe":
+            duration = max(50, min(3000, int(payload.get("duration", 200))))
+
+        via = "scrcpy"
+        try:
+            if not INJECTOR.ensure():
+                raise RuntimeError(INJECTOR.last_error or "注入通道未就绪")
+            if kind == "tap":
+                INJECTOR.tap(int(payload.get("x", 0)), int(payload.get("y", 0)))
+            elif kind == "swipe":
+                INJECTOR.swipe(
+                    int(payload.get("x1", 0)), int(payload.get("y1", 0)),
+                    int(payload.get("x2", 0)), int(payload.get("y2", 0)),
+                    duration,
+                )
+            elif kind == "key":
+                INJECTOR.key(key_name)
+            else:
+                INJECTOR.text(safe_text)
+        except Exception:  # noqa: BLE001 — 常驻通道异常时回退到 adb input
+            via = "adb"
+            rc, _, err = self._adb_input_fallback(kind, payload, safe_text if kind == "text" else "")
+            if rc != 0:
+                return self._error(502, "注入失败：%s" % err)
+
         # 注入后补一张最终画面（screenrecord 在动画结束时不一定出新帧）
         HUB.request_refresh()
-        self._json(200, {"ok": True})
+        self._json(200, {"ok": True, "via": via})
+
+    def _adb_input_fallback(self, kind, payload, safe_text):
+        if kind == "tap":
+            return adb_shell(["input", "tap", str(int(payload.get("x", 0))), str(int(payload.get("y", 0)))], timeout=15)
+        if kind == "swipe":
+            args = [str(int(payload.get(k, 0))) for k in ("x1", "y1", "x2", "y2")]
+            duration = max(50, min(3000, int(payload.get("duration", 200))))
+            return adb_shell(["input", "swipe"] + args + [str(duration)], timeout=20)
+        if kind == "key":
+            return adb_shell(["input", "keyevent", KEY_EVENTS[str(payload.get("key", "")).upper()]], timeout=15)
+        return adb_shell(["input", "text", safe_text.replace(" ", "%s")], timeout=15)
 
     # ---- APK 安装 ----
 
@@ -624,10 +815,16 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def adb_watchdog():
-    """后台保活：确保 adb 连上 redroid。"""
+    """后台保活：确保 adb 连上 redroid，并预热低延迟注入通道。"""
     while True:
         try:
-            adb_connect()
+            if adb_connect() and not INJECTOR.ready:
+                # 设备重启/容器重建后 socket 会失效；这里自动重推 jar、重启服务
+                if INJECTOR.ensure():
+                    print("[android-box] scrcpy 注入通道就绪", flush=True)
+                else:
+                    print("[android-box] scrcpy 注入通道未就绪：%s" % INJECTOR.last_error,
+                          file=sys.stderr, flush=True)
         except Exception:  # noqa: BLE001
             pass
         time.sleep(10)

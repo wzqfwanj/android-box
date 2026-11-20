@@ -28,8 +28,9 @@
 | 能力 | 说明 |
 | --- | --- |
 | 实时画面 | 容器内 Android 屏幕经 `adb screenrecord`（H.264）→ `ffmpeg` 转 MJPEG → 浏览器 `<img>` 实时显示；`screenrecord` 不可用时自动降级为逐帧 `screencap` |
-| 触摸操作 | 点按 = 设备触摸，拖动 = 滑屏；浏览器坐标按设备分辨率换算后经 `adb shell input` 注入真实系统 |
-| 按键控制 | 返回 / 主屏 / 最近任务 / 音量 − / 音量 + / 电源（`adb shell input keyevent`） |
+| 触摸操作 | 点按 = 设备触摸，拖动 = 滑屏；浏览器坐标按设备分辨率换算后经**常驻注入通道**（scrcpy-server）注入真实系统，实测 ~30ms；通道异常时自动回退 `adb shell input` |
+| 按键控制 | 返回 / 主屏 / 最近任务 / 音量 − / 音量 + / 电源（常驻注入通道，实测 ~30ms） |
+| 低延迟注入 | 内置 `scrcpy-server v2.4`（Apache-2.0，© Genymobile）常驻设备端，避免每次 `adb shell input` 冷启动 Java 进程（实测 700~800ms → ~30ms） |
 | 上传装 APK | 页面选择 APK 上传（上限 500MB），后端 `adb install -r -g` 安装，页面显示上传进度与安装结果 |
 | 多端观看 | 多个浏览器连接共享同一路 MJPEG 流，服务端只采集一份画面，慢客户端自动丢帧 |
 | 状态与重连 | `/api/state` 轮询显示 adb 在线、Android 是否启动完成、画面模式；画面断开自动重连 |
@@ -43,7 +44,7 @@
 | 设备 | redroid（AOSP Android 11，x86_64） | Docker 容器里运行的真实 Android，`--privileged` + binderfs |
 | 后端 | Python 3.12 标准库 | `http.server` + `threading` + `subprocess`，单文件 `app.py`，无第三方依赖、无需 pip |
 | 画面 | `adb` + `ffmpeg` | `adb exec-out screenrecord`(H.264) → `ffmpeg` 转 MJPEG → `multipart/x-mixed-replace` 流；异常时降级逐帧截图 |
-| 输入 | `adb shell input` | `tap` / `swipe` / `keyevent` / `text` 注入真实 Android |
+| 输入 | scrcpy-server 常驻通道（回退 `adb shell input`） | 维护一条到设备的长连接，触摸/按键只写几十字节；服务端自带重连与 jar 自动重推 |
 | 前端 | 原生 HTML + CSS + JavaScript | 零依赖、零构建，无框架、无 CDN、无网络字体 |
 | 部署 | systemd + Docker + Caddy | `redroid.service` 管容器、`android-box.service` 管 Web 服务；Caddy 子路径反代并关闭响应缓冲 |
 
@@ -56,6 +57,8 @@ android-box/
 ├── style.css                 # 灰阶单主题样式，仅使用 :root 中 5 个变量
 ├── app.js                    # 前端交互（原生 JS，无框架）
 ├── favicon.svg               # 站点图标（本地 SVG，无外链）
+├── assets/
+│   └── scrcpy-server-v2.4    # 低延迟注入服务（Apache-2.0，© Genymobile；服务启动时自动推送到设备）
 ├── tests/
 │   └── test_app.py           # HTTP 层黑盒测试（unittest，adb/ffmpeg 用假命令）
 ├── deploy/
@@ -114,6 +117,7 @@ android-box/
 | `STREAM_FPS` | `8` | 兜底逐帧截图模式的帧率上限（screenrecord 正常时按实际画面变化出帧） |
 | `STREAM_Q` | `7` | MJPEG 质量（2~31，越小越清晰、越费 CPU/带宽） |
 | `APP_TZ` | `Asia/Shanghai` | 日志与接口时间时区 |
+| `SCRCPY_PORT` | `27183` | 低延迟注入通道的 adb forward 本地端口 |
 | `ADB_BIN` | `adb` | adb 可执行文件路径（可选） |
 | `FFMPEG_BIN` | `ffmpeg` | ffmpeg 可执行文件路径（可选） |
 
@@ -175,7 +179,8 @@ bash deploy/deploy.sh
 
 - **指令集**：容器是 x86_64 Android。**仅支持 ARM 的 APK 装不上**（`INSTALL_FAILED_NO_MATCHING_ABIS`），
   需要 x86_64 或包含 x86_64 的 universal APK。
-- **性能**：应用机为 2 vCPU / 3.4GB，默认约 **8fps**、触摸为**百毫秒级延迟**；
+- **性能**：应用机为 2 vCPU / 3.4GB，画面默认约 **8fps**（480×854）；
+  输入走常驻注入通道，实测 **~30ms**（回退 `adb shell input` 时约 700ms）；
   画面参数（`STREAM_W` / `STREAM_FPS` / `STREAM_Q`）可在 `/etc/android-box.env` 调整。
 - **系统镜像**：AOSP Android 11，**没有 GApps / Google Play 服务**，依赖 Google 服务的应用无法使用。
 - **音频**：只传输画面，**没有声音**。
@@ -204,3 +209,6 @@ bash deploy/deploy.sh
 ## 许可证
 
 [MIT License](LICENSE) © 2026 wzqfwanj
+
+内置的 `assets/scrcpy-server-v2.4` 来自 [Genymobile/scrcpy](https://github.com/Genymobile/scrcpy)，
+遵循 **Apache License 2.0**（© Genymobile），仅用于低延迟输入注入，随仓库原样分发。

@@ -21,3 +21,5 @@
 *.woff2 binary
 *.apk binary
 *.tar.gz binary
+*.jar binary
+assets/scrcpy-server-* binary
