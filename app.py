@@ -916,27 +916,31 @@ class Handler(BaseHTTPRequestHandler):
         )
 
 
-def prepare_device():
+def prepare_device(quiet=False):
     """系统级低延迟设置：关闭窗口/过渡/动画时长。
 
-    Android 的转场动画本身要 300~500ms，关掉后应用切换/弹窗立即到位，
-    配合截图轮询（~200ms/帧）可以把交互反馈压到几百毫秒内。
+    Android 的转场动画本身要 300~500ms，关掉后应用切换/弹窗立即到位。
+    容器以 --rm 运行，重启后 /data 清空、设置会恢复默认，因此 watchdog 每 60 秒
+    幂等重放一次（4 条 adb shell，开销可忽略）。
     """
     for key in ("window_animation_scale", "transition_animation_scale", "animator_duration_scale"):
         adb_shell(["settings", "put", "global", key, "0"], timeout=10)
     adb_shell(["settings", "put", "system", "screen_off_timeout", "1800000"], timeout=10)
-    print("[android-box] 已关闭系统动画、加长熄屏超时", flush=True)
+    if not quiet:
+        print("[android-box] 已关闭系统动画、加长熄屏超时", flush=True)
 
 
 def adb_watchdog():
-    """后台保活：确保 adb 连上 redroid，预热低延迟注入通道，并关闭系统动画。"""
-    prepared = False
+    """后台保活：adb 连接、注入通道预热、周期性重放低延迟系统设置。"""
+    last_prepare = 0.0
+    first_prepare = True
     while True:
         try:
             if adb_connect():
-                if not prepared:
-                    prepare_device()
-                    prepared = True
+                if time.time() - last_prepare > 60:
+                    prepare_device(quiet=not first_prepare)
+                    first_prepare = False
+                    last_prepare = time.time()
                 if not INJECTOR.ready:
                     # 设备重启/容器重建后 socket 会失效；这里自动重推 jar、重启服务
                     if INJECTOR.ensure():
@@ -944,8 +948,6 @@ def adb_watchdog():
                     else:
                         print("[android-box] scrcpy 注入通道未就绪：%s" % INJECTOR.last_error,
                               file=sys.stderr, flush=True)
-            else:
-                prepared = False
         except Exception:  # noqa: BLE001
             pass
         time.sleep(10)
