@@ -107,10 +107,16 @@ chmod 600 /etc/android-box/aliyun.json
 #    handle_path /android/* { reverse_proxy 127.0.0.1:8150 { header_up X-Forwarded-Prefix /android ... } }
 ```
 
-之后每次发布：
+之后每次发布（二选一）：
 
 ```bash
+# Linux / macOS / Git Bash
 bash deploy/deploy.sh
+```
+
+```powershell
+# Windows PowerShell（本机没有 bash 时用这个）
+powershell -ExecutionPolicy Bypass -File deploy/deploy.ps1
 ```
 
 脚本会推 GitHub、`git archive` → scp → 解压到 `/opt/android-box`、同步 systemd 单元、
