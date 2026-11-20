@@ -227,7 +227,7 @@
 
   function startSession(ticketInfo) {
     var connConfig = {
-      disableCamera: true,
+      disableCamera: false,
       decodeType: 2,
       useCustomIme: true,
       disableOrientation: false,
