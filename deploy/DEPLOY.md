@@ -229,6 +229,18 @@ ssh dev 'ls -ld /var/lib/android-box /var/lib/android-box/tmp'   # 期望 androi
 - `/api/state` 里 `stream.mode` 为 `screenrecord`（实时）或 `screencap`（逐帧兜底），`stream.error` 为空最佳。
 - 若 `adb_online=false`：等容器启动完成，或 `journalctl -u android-box -n 100` 看 adb 报错。
 
+**低延迟注入通道（scrcpy-server）自检**：`app.py` 仓库内自带 `assets/scrcpy-server-v2.4`，
+服务启动后会自动推送到设备 `/data/local/tmp/scrcpy-server.jar` 并启动常驻注入进程（容器重建后会重推）。
+
+```bash
+ssh dev 'journalctl -u android-box -n 30 --no-pager | grep "scrcpy 注入通道就绪"'   # 期望有一行
+ssh dev 'adb -s 127.0.0.1:5555 shell ps -A | grep -i scrcpy'                       # 设备端进程
+ssh dev "curl -s -X POST http://127.0.0.1:8150/api/input -H 'Content-Type: application/json' -d '{\"type\":\"key\",\"key\":\"HOME\"}'"
+# 返回 {"ok":true,"via":"scrcpy"} 即走常驻通道（毫秒级）；via=adb 表示回退到 adb input（约 700ms）
+```
+
+> 注：`assets/scrcpy-server-v2.4` 来自 Genymobile/scrcpy（Apache-2.0），随仓库分发，仅用于输入注入。
+
 ## 6 网关机：Caddy 子路径路由
 
 ### 6.1 备份配置
@@ -426,6 +438,7 @@ systemctl restart redroid
 | 页面能打开但黑屏 / 一直「正在连接安卓系统…」 | adb 未连上，或 ffmpeg 缺失/异常 | `docker ps --filter name=redroid`；`adb devices`；`curl /api/state` 看 `adb_online` 与 `stream.error`；`command -v adb ffmpeg`；`journalctl -u android-box -n 100` |
 | 画面显示「逐帧」模式 | redroid 的 `screenrecord` 不可用，后端自动降级 `screencap` | 可继续使用（帧率略低）；`/api/state` 的 `stream.mode/error` 有说明；必要时重启 redroid |
 | 点按/滑动没反应 | 设备未 boot 完成、输入注入失败、坐标换算异常 | `adb shell getprop sys.boot_completed` 应为 1；`adb shell input tap 360 640` 手工测试；看页面 toast 与接口 502 报错 |
+| 输入延迟高（每次约 0.5~1 秒） | 走的是 `adb shell input` 回退路径（常驻注入通道未就绪） | `curl -X POST /api/input ...` 看返回 `via` 字段；`journalctl -u android-box \| grep scrcpy`；`adb shell ls /data/local/tmp/scrcpy-server.jar`；必要时 `systemctl restart android-box` 触发自动重推与重连 |
 | 输入中文无效 | 后端 `adb input text` 只支持 ASCII（应用限制） | 点设备里的输入框，用 Android 软键盘输入 |
 | 安装 APK 失败 `INSTALL_FAILED_NO_MATCHING_ABIS` | APK 仅支持 ARM，容器是 x86_64 | 换 x86_64 或 universal（含 x86_64）的 APK；本环境装不上 ARM-only 应用 |
 | 上传 APK 报 413 | 超过 500MB 上限 | 换小一点的 APK；或修改 app.py 的 `MAX_UPLOAD`（需重新发布） |
