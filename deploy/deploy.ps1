@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env pwsh
+﻿﻿#!/usr/bin/env pwsh
 # =============================================================================
 # deploy/deploy.ps1 —— android-box 一键发布（Windows PowerShell 版）
 #
