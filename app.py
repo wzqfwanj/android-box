@@ -1156,8 +1156,22 @@ class Handler(BaseHTTPRequestHandler):
         client = WSClient(self.connection)
         WSVIDEO.add(client)
         HUB.attach_ws()
-        # 管线本来就没在跑时，新起编码器会直接给 config+关键帧，不需要重建；
-        # 只有「正在直播但没有可用关键帧」才重建编码器强刷一个关键帧。
+        # 等管线确定模式：只有 scrcpy 视频模式才能走 WebCodecs；
+        # 截图轮询/ffmpeg 兜底模式下主动关闭，让前端回退到 MJPEG。
+        deadline = time.time() + 3.0
+        while time.time() < deadline and HUB.mode == "":
+            time.sleep(0.1)
+        if HUB.mode != "scrcpy":
+            try:
+                ws_send_frame(self.connection, 0x8, b"")
+            except OSError:
+                pass
+            WSVIDEO.remove(client)
+            client.close()
+            HUB.detach_ws()
+            self.close_connection = True
+            return
+        # 正在直播但没有可用关键帧时，重建编码器强刷一个关键帧
         if HUB.running and not WSVIDEO.has_fresh_keyframe():
             HUB.request_restart()
         try:
