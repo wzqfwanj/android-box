@@ -22,6 +22,7 @@
 启动：python app.py  →  http://127.0.0.1:8150
 """
 
+import io
 import json
 import os
 import re
@@ -54,6 +55,18 @@ START_TIME = time.time()
 SCRCPY_JAR = os.path.join(BASE_DIR, "assets", "scrcpy-server-v2.4")
 DEVICE_JAR = "/data/local/tmp/scrcpy-server.jar"
 SCRCPY_PORT = int(os.environ.get("SCRCPY_PORT", "27183"))
+
+# 画面：默认用并行 raw 截图轮询（每帧都是最新截图，延迟稳定 ~200ms）；
+# 没装 Pillow 时自动退回 screenrecord+ffmpeg 的 MJPEG 管线。
+try:
+    from PIL import Image  # python3-pil（系统包，非 pip 依赖）
+
+    HAS_PIL = True
+except Exception:  # noqa: BLE001
+    HAS_PIL = False
+CAPTURE_WORKERS = max(1, min(4, int(os.environ.get("CAPTURE_WORKERS", "2"))))
+JPEG_QUALITY = max(20, min(95, int(os.environ.get("JPEG_QUALITY", "72"))))
+PIXEL_FORMATS = {1: "RGBA", 2: "RGBX", 3: "RGB", 4: "BGR;16", 5: "BGRA"}
 
 try:
     from zoneinfo import ZoneInfo
@@ -158,6 +171,33 @@ def third_party_packages():
     if rc != 0:
         return []
     return sorted(line.split(":", 1)[1] for line in out.splitlines() if ":" in line)
+
+
+def capture_jpeg_raw():
+    """一次原始截图 → Pillow 转 JPEG（~200ms/帧，不经过 H.264 编码器，所以没有编码器排队延迟）。"""
+    if not HAS_PIL:
+        return None
+    proc = subprocess.run(
+        [ADB, "-s", ADB_SERIAL, "exec-out", "screencap"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20,
+    )
+    raw = proc.stdout
+    if len(raw) < 12:
+        return None
+    width, height, fmt = struct.unpack("<III", raw[:12])
+    if width <= 0 or height <= 0:
+        return None
+    pixels = raw[12:]
+    expected = width * height * 4
+    if len(pixels) < expected:
+        return None
+    img = Image.frombytes(PIXEL_FORMATS.get(fmt, "RGBA"), (width, height), pixels).convert("RGB")
+    if width != STREAM_W:
+        target_h = max(1, round(height * STREAM_W / width))
+        img = img.resize((STREAM_W, target_h), Image.BILINEAR)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=JPEG_QUALITY)
+    return buf.getvalue()
 
 
 # ------------------------------------------------------------------ 低延迟注入
@@ -376,8 +416,13 @@ class FrameHub:
                 self._publish(frame)
 
     def _seed_frame(self):
-        """先截一帧静态画面，避免屏幕静止时（screenrecord 不产帧）浏览器一直黑屏。"""
+        """先截一帧静态画面，避免浏览器黑屏。优先走 raw+Pillow 快路径（~200ms）。"""
         try:
+            if HAS_PIL:
+                jpeg = capture_jpeg_raw()
+                if jpeg:
+                    self._publish(jpeg)
+                    return
             with ADB_LOCK:
                 cap = subprocess.run(
                     [ADB, "-s", ADB_SERIAL, "exec-out", "screencap", "-p"],
@@ -459,31 +504,64 @@ class FrameHub:
             self._publish(buf[start:end + 2])
             buf = buf[end + 2:]
 
+    def _poll_worker(self):
+        """raw 截图轮询：每帧都是「当前屏幕」的即时截图，没有编码器排队延迟。"""
+        while self.running:
+            if self.stop_at and time.time() > self.stop_at:
+                break
+            try:
+                jpeg = capture_jpeg_raw()
+                if jpeg:
+                    self._publish(jpeg)
+                else:
+                    time.sleep(0.2)
+            except Exception as exc:  # noqa: BLE001
+                self._set_error("截图失败：%s" % exc)
+                time.sleep(0.5)
+        if self.mode == "poll" and not self.running:
+            return
+
+    def _supervise_poll(self):
+        """并行 raw 截图（默认 2 路 ≈ 7fps），每帧延迟稳定 ~200ms。"""
+        self.mode = "poll"
+        threads = [
+            threading.Thread(target=self._poll_worker, daemon=True)
+            for _ in range(CAPTURE_WORKERS)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
     def _supervise(self):
         self.running = True
-        self._seed_frame()  # 先给浏览器一帧静态画面
-        while self.running:
-            if td := self.stop_at:
-                if time.time() > td:
-                    break
-            try:
-                self.mode = "screenrecord"
-                started = time.time()
-                self._pipeline_screenrecord()
-                if time.time() - started < 10:
-                    raise RuntimeError("screenrecord 管线很快退出")
-            except Exception as exc:  # noqa: BLE001
-                self._set_error("screenrecord 不可用，改用逐帧截图：%s" % exc)
-                self.mode = "screencap"
-                try:
-                    self._pipeline_screencap()
-                except Exception as exc2:  # noqa: BLE001
-                    self._set_error("截图兜底也失败：%s" % exc2)
-                    time.sleep(2)
-            if not self.running:
-                break
-        self.running = False
-        self.mode = ""
+        try:
+            if HAS_PIL:
+                self._supervise_poll()
+            else:
+                self._seed_frame()  # 无 Pillow 时退回 ffmpeg 管线，先给一帧静态画面
+                while self.running:
+                    if self.stop_at and time.time() > self.stop_at:
+                        break
+                    try:
+                        self.mode = "screenrecord"
+                        started = time.time()
+                        self._pipeline_screenrecord()
+                        if time.time() - started < 10:
+                            raise RuntimeError("screenrecord 管线很快退出")
+                    except Exception as exc:  # noqa: BLE001
+                        self._set_error("screenrecord 不可用，改用逐帧截图：%s" % exc)
+                        self.mode = "screencap"
+                        try:
+                            self._pipeline_screencap()
+                        except Exception as exc2:  # noqa: BLE001
+                            self._set_error("截图兜底也失败：%s" % exc2)
+                            time.sleep(2)
+                    if not self.running:
+                        break
+        finally:
+            self.running = False
+            self.mode = ""
 
     def _start(self):
         with self.lock:
@@ -513,6 +591,8 @@ class FrameHub:
             threading.Thread(target=self._refresh_seed, daemon=True).start()
 
     def _refresh_seed(self):
+        if self.mode == "poll":
+            return  # 轮询模式下每帧都是最新截图，无需补帧
         if not self.seed_lock.acquire(blocking=False):
             return
         try:
@@ -525,10 +605,10 @@ class FrameHub:
     def request_refresh(self):
         """输入注入后按需补「操作完成后的最终画面」。
 
-        screenrecord 只在画面变化时出帧，动画结束那一帧经常抓不到；但每次输入都
-        强制截图又会把画面延迟拉高（screencap 单次要 ~0.5s）。所以只在「注入后
-        确实没有新帧」时才补截图，避免覆盖正在播放的动画帧。
+        轮询模式（默认）每帧都是即时截图，不需要补帧；只有退回 ffmpeg 管线时才补。
         """
+        if self.mode == "poll":
+            return
         injected_at = time.time()
         with self.lock:
             if injected_at - self.last_refresh < 0.25:
