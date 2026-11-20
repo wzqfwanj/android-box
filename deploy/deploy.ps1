@@ -1,11 +1,12 @@
 ﻿# =============================================================================
 # deploy/deploy.ps1 —— android-box 一键发布（Windows PowerShell 版）
 #
-# 与 deploy.sh 等价：推 GitHub → git archive → scp 到网关机 → 解压覆盖
-# /opt/android-box → 同步 systemd 单元 → 重启 → 健康检查 → 网关机验证。
+# 与 deploy.sh 等价：推 GitHub → git archive（含 cp/ SDK）→ scp 到网关机 →
+# 解压覆盖 /opt/android-box → 同步 systemd 单元 → 重启 → 健康检查 → 网关机验证。
 #
 # 前置：~/.ssh/config 配好 Host aliyun；网关机已有 /etc/android-box/cloud.env、
-#       /etc/android-box/aliyun.json、Caddy 反代 /android/* → 127.0.0.1:8150。
+#       /etc/android-box/aliyun.json、Caddy 反代 /android/* → 127.0.0.1:8150；
+#       本机 cp/ 内有无影 Web SDK（见 README）。
 #
 # 用法（仓库根目录）：
 #   powershell -ExecutionPolicy Bypass -File deploy/deploy.ps1
@@ -43,6 +44,7 @@ $commit = (git rev-parse --short HEAD).Trim()
 $tmp = Join-Path $repo ".tmp-deploy"
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 $tgz = Join-Path $tmp ("android-box-{0}.tar.gz" -f [DateTimeOffset]::UtcNow.ToUnixTimeSeconds())
+$cpTgz = Join-Path $tmp "android-box-cp.tar.gz"
 try {
     Log "打包 HEAD ..."
     git archive --format=tar.gz -o $tgz HEAD
@@ -52,9 +54,21 @@ try {
     scp -q $tgz "${appHost}:/tmp/android-box.tar.gz"
     if ($LASTEXITCODE -ne 0) { Fail "scp 上传失败" }
 
+    # 无影 Web SDK（cp/）不入库，单独打包上传，避免覆盖部署时丢文件
+    $hasCp = Test-Path (Join-Path $repo "cp/WuyingWebSDK.js")
+    if ($hasCp) {
+        Log "打包 Web SDK（cp/，不入库）..."
+        tar -czf $cpTgz -C $repo cp
+        scp -q $cpTgz "${appHost}:/tmp/android-box-cp.tar.gz"
+        if ($LASTEXITCODE -ne 0) { Fail "SDK 上传失败" }
+    } else {
+        Log "警告：本机没有 cp/WuyingWebSDK.js，部署后页面会因缺 SDK 无法串流（见 README）"
+    }
+
     Log "解压覆盖 /opt/android-box 并重启服务 ..."
     $remote = "set -e; rm -rf /opt/android-box; mkdir -p /opt/android-box; " +
         "tar -xzf /tmp/android-box.tar.gz -C /opt/android-box; rm -f /tmp/android-box.tar.gz; " +
+        "if [ -f /tmp/android-box-cp.tar.gz ]; then tar -xzf /tmp/android-box-cp.tar.gz -C /opt/android-box; rm -f /tmp/android-box-cp.tar.gz; fi; " +
         "chmod -R go-w /opt/android-box; " +
         "test -f /etc/android-box/cloud.env; " +
         "if ! cmp -s /opt/android-box/deploy/android-box.service /etc/systemd/system/android-box.service; then " +
@@ -81,6 +95,10 @@ try {
     if ($ticketCode -ne "200") { Fail "/android/api/cp/ticket 未返回 200（实际：$ticketCode）" }
     Log "/android/api/cp/ticket -> 200"
 
+    $sdkCode = (ssh $appHost "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8150/cp/WuyingWebSDK.js").Trim()
+    if ($sdkCode -ne "200") { Fail "SDK 静态资源缺失（/cp/WuyingWebSDK.js = $sdkCode）：按 README 放好 cp/ 后重发" }
+    Log "/cp/WuyingWebSDK.js -> 200"
+
     $pub = (curl.exe -s -o NUL -m 15 -w "%{http_code}" $siteUrl).Trim()
     if ($pub -eq "401") { Log "公网未登录 -> 401（Basic Auth 生效）" }
     else { Log "提示：公网未登录返回 $pub（预期 401）" }
@@ -91,6 +109,7 @@ try {
 }
 finally {
     if (Test-Path $tgz) { Remove-Item $tgz -Force -ErrorAction SilentlyContinue }
+    if (Test-Path $cpTgz) { Remove-Item $cpTgz -Force -ErrorAction SilentlyContinue }
     $left = @(Get-ChildItem $tmp -Force -ErrorAction SilentlyContinue)
     if ($left.Count -eq 0) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
 }
