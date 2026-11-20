@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """无影云手机按需管理（纯标准库）：创建 / 释放 / 状态 / 装 APK。
 
 用法：
@@ -145,12 +145,31 @@ def delete_network():
         return
     site_id = site["OfficeSiteId"]
     print("删除网络 %s ..." % site_id)
-    ecd("DeleteOfficeSite", {"OfficeSiteId": site_id})
-    wait("网络删除完成", lambda: find_network() is None, timeout=300, interval=10)
-    print("网络已删除（NAT/EIP 等随之释放）")
+    for attempt in range(1, 8):
+        try:
+            ecd("DeleteOfficeSites", {"OfficeSiteId.1": site_id})
+            wait("网络删除完成", lambda: find_network() is None, timeout=300, interval=10)
+            print("网络已删除（NAT/EIP 等随之释放）")
+            return
+        except RuntimeError as exc:
+            msg = str(exc)
+            if not any(token in msg for token in ("DependencyViolation", "InUse", "NetworkPackage")):
+                raise
+            # 先把带宽包删掉，等实例组异步清理完成后再重试
+            try:
+                packages = ecd("DescribeNetworkPackages", {"OfficeSiteId": site_id}).get("NetworkPackages") or []
+                for pkg in packages:
+                    try:
+                        ecd("DeleteNetworkPackages", {"NetworkPackageId": pkg["NetworkPackageId"]})
+                        print("  已删除带宽包 %s" % pkg["NetworkPackageId"])
+                    except RuntimeError:
+                        pass
+            except RuntimeError:
+                pass
+            print("  网络仍有依赖，20 秒后重试（%d/7）..." % attempt)
+            time.sleep(20)
+    raise RuntimeError("网络删除失败（依赖未释放）：稍后再执行一次 release，或到云手机控制台删除该网络")
 
-
-# ---------------------------------------------------------------- 实例组
 
 def list_groups():
     data = aic("DescribeAndroidInstanceGroups", {"RegionId": REGION})
@@ -226,6 +245,9 @@ def oss_headers(method, bucket, key="", content_type="", expires=None):
 
 
 def _oss_request(method, bucket, key="", data=b"", content_type=""):
+    # urllib 对带 body 的请求会自动补 Content-Type，签名必须用同一个值
+    if method in ("PUT", "POST") and not content_type:
+        content_type = "application/octet-stream"
     auth, date, _ = oss_headers(method, bucket, key, content_type)
     url = "https://%s.%s/%s" % (bucket, OSS_ENDPOINT, urllib.parse.quote(key))
     req = urllib.request.Request(url, data=data if method in ("PUT", "POST") else None, method=method)

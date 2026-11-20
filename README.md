@@ -25,7 +25,8 @@ android-box/
 ├── cloud.js                # 前端：取 Ticket → 创建 SDK 会话 → 状态提示/重连/全屏
 ├── style.css               # 灰阶样式（5 个 CSS 变量，375px 无横向滚动）
 ├── favicon.svg
-├── tools/cp_ticket.py      # 纯标准库：HMAC-SHA1 签名调 BatchGetAcpConnectionTicket
+├── tools/cp_ticket.py      # 纯标准库：HMAC-SHA1 签名调 BatchGetAcpConnectionTicket（按组名自动找实例）
+├── tools/cloudphone.py     # 按需创建/释放云手机、安装 APK（创建后无需改配置/重启）
 ├── cp/                     # 无影 Web SDK（不入库，部署时手动放置，见下）
 │   ├── WuyingWebSDK.js
 │   └── sdk/ASP/container.html
@@ -51,7 +52,8 @@ android-box/
 | --- | --- | --- |
 | `HOST` | `127.0.0.1` | 监听地址（只给 Caddy 反代用，不要直接暴露公网） |
 | `PORT` | `8150` | 监听端口 |
-| `CLOUD_PHONE_INSTANCE` | 空 | 云手机实例 ID（`acp-...`）；不配置则页面提示未配置 |
+| `CLOUD_PHONE_INSTANCE` | 空 | 可选：手动指定实例 ID（`acp-...`）；不填则按 `CP_GROUP_NAME` 自动发现当前运行中的实例 |
+| `CP_GROUP_NAME` | 空（工具默认 `android-box-vpc`） | 实例组名：创建/释放后服务自动跟随，无需重启 |
 | `CP_REGION` | `cn-shanghai` | 云手机地域 |
 | `ALIYUN_CONFIG` | `~/.aliyun/config.json` | 阿里云凭据文件（取第一个 profile 的 AK/SK） |
 
@@ -91,7 +93,7 @@ ALIYUN_CONFIG=/etc/android-box/aliyun.json CLOUD_PHONE_INSTANCE=acp-xxxxxxxx pyt
 # 1) 服务配置（root 600）
 mkdir -p /etc/android-box
 cat > /etc/android-box/cloud.env <<'EOF'
-CLOUD_PHONE_INSTANCE=acp-xxxxxxxx
+CP_GROUP_NAME=android-box-vpc
 CP_REGION=cn-shanghai
 ALIYUN_CONFIG=/etc/android-box/aliyun.json
 EOF
@@ -128,10 +130,29 @@ powershell -ExecutionPolicy Bypass -File deploy/deploy.ps1
 python3 -m unittest discover -s tests -v
 ```
 
-## 计费与释放
+## 按需使用：创建 / 释放
 
-云手机按量约 **0.30 元/小时**（4 小时一个计费单位，关机也计费），不用时务必释放实例组
-（`DeleteAndroidInstanceGroup`），否则会持续扣费；长期使用可以改为包月（更便宜）。
+平时保持**释放**状态（实例组 + 网络全删，0 计费）；要用的时候一条命令建回来，
+服务会按 `CP_GROUP_NAME` 自动发现新实例，**不用改配置、不用重启**：
+
+```bash
+# 创建（首次创建网络约 1~2 分钟）+ 顺手装美团
+python tools/cloudphone.py create --install-apk ~/Downloads/meituan.apk
+
+# 只创建、之后再装 / 验证
+python tools/cloudphone.py create
+python tools/cloudphone.py install-apk ~/Downloads/meituan.apk
+
+# 查看当前状态（网络/实例组/实例）
+python tools/cloudphone.py status
+
+# 用完释放（实例组删除后会等网络依赖释放再自动重试删网络）
+python tools/cloudphone.py release
+```
+
+- 未创建时页面会提示「云手机当前未创建（已释放）」并给出创建命令，不影响其他页面。
+- 成本：创建后按量 **0.30 元/小时**、4 小时一个计费单位（≈1.2 元/次起）；**释放后 0 计费**。
+- APK 通过临时 OSS 预签名链接给云手机下载，用完自动清理；本机不需要公网端口。
 
 ## 限制
 
