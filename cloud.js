@@ -1,4 +1,4 @@
-/* ============================================================
+﻿/* ============================================================
    android-box · 在线真机（ARM 云手机）
    电源按钮：开机 = 创建（含装美团），关机 = 释放
    画面来自 iframe 内阿里云 Web SDK。
@@ -230,8 +230,8 @@
       disableCamera: true,
       decodeType: 2,
       useCustomIme: true,
-      disableOrientation: true,
-      resolutionAdaptive: false,
+      disableOrientation: false,
+      resolutionAdaptive: true,
     };
     var appInfo = {
       appId: "android",
@@ -294,6 +294,32 @@
     }
   }
 
+  // ---- 全屏画面 ----
+
+  function enterFullscreen() {
+    document.body.classList.add("is-fullscreen");
+    window.scrollTo(0, 0);
+    var root = document.documentElement;
+    if (root.requestFullscreen) {
+      root.requestFullscreen().catch(function () { /* iOS 等不支持时用 CSS 全屏兜底 */ });
+    }
+    try {
+      if (screen.orientation && screen.orientation.lock) {
+        screen.orientation.lock("portrait").catch(function () {});
+      }
+    } catch (err) { /* 忽略 */ }
+  }
+
+  function exitFullscreen() {
+    document.body.classList.remove("is-fullscreen");
+    if (document.fullscreenElement && document.exitFullscreen) {
+      document.exitFullscreen().catch(function () {});
+    }
+    try {
+      if (screen.orientation && screen.orientation.unlock) screen.orientation.unlock();
+    } catch (err) { /* 忽略 */ }
+  }
+
   // ---- 启动 ----
 
   function boot() {
@@ -316,12 +342,15 @@
       });
     }
     var fullscreen = $("#fullscreen");
-    if (fullscreen) {
-      fullscreen.addEventListener("click", function () {
-        var shell = $("#phone");
-        if (shell && shell.requestFullscreen) shell.requestFullscreen();
-      });
-    }
+    if (fullscreen) fullscreen.addEventListener("click", enterFullscreen);
+    var exitBtn = $("#exitFullscreen");
+    if (exitBtn) exitBtn.addEventListener("click", exitFullscreen);
+    document.addEventListener("fullscreenchange", function () {
+      if (!document.fullscreenElement) document.body.classList.remove("is-fullscreen");
+    });
+    document.addEventListener("keydown", function (event) {
+      if (event.key === "Escape" && document.body.classList.contains("is-fullscreen")) exitFullscreen();
+    });
     renderPower();
     fetchPower().then(function () {
       if (state.power === "on") connect();

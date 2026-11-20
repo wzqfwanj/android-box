@@ -167,3 +167,70 @@ main {
   color: var(--dim);
   font-size: 13px;
 }
+
+/* ---- 全屏画面：铺满整个手机屏幕 ---- */
+#exitFullscreen {
+  display: none;
+  position: fixed;
+  top: calc(10px + env(safe-area-inset-top));
+  right: calc(10px + env(safe-area-inset-right));
+  z-index: 20;
+  padding: 6px 14px;
+  font-size: 13px;
+  background: rgba(42, 42, 45, 0.9);
+}
+
+body.is-fullscreen {
+  overflow: hidden;
+  background: #000;
+}
+
+body.is-fullscreen main {
+  max-width: none;
+  padding: 0;
+}
+
+body.is-fullscreen .head,
+body.is-fullscreen .power-row,
+body.is-fullscreen .toolbar,
+body.is-fullscreen .status,
+body.is-fullscreen .hint {
+  display: none;
+}
+
+body.is-fullscreen .stage {
+  position: fixed;
+  inset: 0;
+  margin: 0;
+  gap: 0;
+  background: #000;
+}
+
+body.is-fullscreen .phone {
+  width: 100vw;
+  height: 100dvh;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #000;
+}
+
+body.is-fullscreen .screen {
+  width: 100vw;
+  height: 100dvh;
+  aspect-ratio: auto;
+  border-radius: 0;
+}
+
+body.is-fullscreen .cloud-container {
+  position: absolute;
+  inset: 0;
+}
+
+body.is-fullscreen #exitFullscreen {
+  display: block;
+}
