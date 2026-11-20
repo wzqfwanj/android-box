@@ -127,25 +127,44 @@ ADB_LOCK = threading.Lock()
 
 
 def adb(args, timeout=20, input_data=None):
-    """执行 adb 命令，返回 (rc, stdout, stderr)。调用方需注意并发（外部有锁）。"""
+    """执行 adb 命令，返回 (rc, stdout, stderr)。
+
+    注意：Windows 上 adb 客户端会拉起 adb server，server 会继承 stdout 管道句柄，
+    用 PIPE 时 subprocess.run 可能永远等不到 pipe 关闭（表现为「服务卡死」）。
+    这里把输出重定向到临时文件，彻底绕开管道等待。
+    """
     cmd = [ADB, "-s", ADB_SERIAL] + args
+    out_path = err_path = None
     try:
-        proc = subprocess.run(
-            cmd,
-            input=input_data,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout,
-        )
-        return (
-            proc.returncode,
-            proc.stdout.decode("utf-8", "replace").strip(),
-            proc.stderr.decode("utf-8", "replace").strip(),
-        )
+        fd_out, out_path = tempfile.mkstemp(prefix="adbox-")
+        fd_err, err_path = tempfile.mkstemp(prefix="adbox-")
+        with os.fdopen(fd_out, "wb") as fout, os.fdopen(fd_err, "wb") as ferr:
+            kwargs = {"stdout": fout, "stderr": ferr, "timeout": timeout}
+            if input_data is None:
+                kwargs["stdin"] = subprocess.DEVNULL
+            else:
+                kwargs["input"] = input_data
+            try:
+                proc = subprocess.run(cmd, **kwargs)
+                rc = proc.returncode
+            except subprocess.TimeoutExpired:
+                rc = 124
+        with open(out_path, "rb") as fh:
+            out = fh.read().decode("utf-8", "replace").strip()
+        with open(err_path, "rb") as fh:
+            err = fh.read().decode("utf-8", "replace").strip()
+        if rc == 124:
+            err = err or "adb 命令超时（%ss）" % timeout
+        return rc, out, err
     except FileNotFoundError:
         return 127, "", "找不到 adb 命令"
-    except subprocess.TimeoutExpired:
-        return 124, "", "adb 命令超时（%ss）" % timeout
+    finally:
+        for path in (out_path, err_path):
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
 
 def adb_shell(args, timeout=20):
@@ -181,15 +200,55 @@ def third_party_packages():
     return sorted(line.split(":", 1)[1] for line in out.splitlines() if ":" in line)
 
 
+# 设备信息缓存：/api/state 不直接调 adb（避免 adb 卡住时把 HTTP 请求一起拖死）
+DEVICE_LOCK = threading.Lock()
+DEVICE_INFO = {
+    "online": False, "model": "", "android": "", "sdk": "",
+    "width": 0, "height": 0, "booted": False, "updated": 0.0,
+}
+
+
+def refresh_device_info():
+    online = adb_connect()
+    info = {"online": online, "updated": time.time()}
+    if online:
+        width, height = device_resolution()
+        info.update({
+            "width": width,
+            "height": height,
+            "model": device_prop("ro.product.model") or device_prop("ro.product.device"),
+            "android": device_prop("ro.build.version.release"),
+            "sdk": device_prop("ro.build.version.sdk"),
+            "booted": device_prop("sys.boot_completed") == "1",
+        })
+    with DEVICE_LOCK:
+        DEVICE_INFO.update(info)
+
+
 def capture_jpeg_raw():
-    """一次原始截图 → Pillow 转 JPEG（~200ms/帧，不经过 H.264 编码器，所以没有编码器排队延迟）。"""
+    """一次原始截图 → Pillow 转 JPEG（~150~200ms/帧）。"""
     if not HAS_PIL:
         return None
-    proc = subprocess.run(
-        [ADB, "-s", ADB_SERIAL, "exec-out", "screencap"],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20,
-    )
-    raw = proc.stdout
+    out_path = None
+    fd, out_path = tempfile.mkstemp(prefix="adbox-shot-")
+    os.close(fd)
+    try:
+        with open(out_path, "wb") as fout:
+            try:
+                subprocess.run(
+                    [ADB, "-s", ADB_SERIAL, "exec-out", "screencap"],
+                    stdout=fout, stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL, timeout=20,
+                )
+            except subprocess.TimeoutExpired:
+                return None
+        with open(out_path, "rb") as fh:
+            raw = fh.read()
+    finally:
+        try:
+            os.unlink(out_path)
+        except OSError:
+            pass
     if len(raw) < 12:
         return None
     width, height, fmt = struct.unpack("<III", raw[:12])
@@ -409,12 +468,20 @@ class ScrcpyInjector:
             raise
 
     def _touch(self, action, x, y):
+        # scrcpy 服务端用「视频尺寸」校验触摸事件，尺寸不一致会直接忽略；
+        # 因此坐标要换算到编码后的视频坐标系，并带上视频宽高。
+        video_w, video_h = self.encoded_width, self.encoded_height
+        if video_w and video_h and self.width and self.height:
+            x = int(round(x * video_w / self.width))
+            y = int(round(y * video_h / self.height))
+        else:
+            video_w, video_h = self.width, self.height
         pressure = 0xFFFF if action != ACTION_UP else 0
         action_button = BUTTON_PRIMARY if action == ACTION_DOWN else 0
         buttons = 0 if action == ACTION_UP else BUTTON_PRIMARY
         self._write(struct.pack(
             ">BBqiiHHHii", 2, action, 0x12345678, int(x), int(y),
-            self.width, self.height, pressure, action_button, buttons,
+            video_w, video_h, pressure, action_button, buttons,
         ))
 
     def tap(self, x, y):
@@ -1082,6 +1149,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._state(head_only)
         if path == "/api/apps":
             return self._json(200, {"packages": third_party_packages()}, head_only)
+        if path == "/api/debug/stacks" and os.environ.get("DEBUG") == "1":
+            return self._stacks(head_only)
         static = STATIC_FILES.get(path)
         if static is None:
             return self._error(404, "页面不存在")
@@ -1109,23 +1178,37 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- 状态 ----
 
+    def _stacks(self, head_only=False):
+        """线程栈快照（排查卡死用，仅本机/网关内网可达）。"""
+        import traceback
+        frames = sys._current_frames()
+        names = {thread.ident: thread.name for thread in threading.enumerate()}
+        result = []
+        for ident, frame in frames.items():
+            stack = traceback.format_stack(frame)
+            result.append({
+                "thread": names.get(ident, str(ident)),
+                "stack": "".join(stack[-6:]).strip().splitlines(),
+            })
+        self._json(200, {"threads": result}, head_only)
+
     def _state(self, head_only=False):
-        online = adb_connect()
+        with DEVICE_LOCK:
+            info = dict(DEVICE_INFO)
         payload = {
             "ok": True,
-            "adb_online": online,
+            "adb_online": bool(info.get("online")),
             "serial": ADB_SERIAL,
             "stream": HUB.status(),
             "uptime": int(time.time() - START_TIME),
         }
-        if online:
-            width, height = device_resolution()
+        if info.get("online"):
             payload.update({
-                "model": device_prop("ro.product.model") or device_prop("ro.product.device"),
-                "android": device_prop("ro.build.version.release"),
-                "sdk": device_prop("ro.build.version.sdk"),
-                "resolution": {"width": width, "height": height},
-                "booted": device_prop("sys.boot_completed") == "1",
+                "model": info.get("model") or "",
+                "android": info.get("android") or "",
+                "sdk": info.get("sdk") or "",
+                "resolution": {"width": info.get("width") or 0, "height": info.get("height") or 0},
+                "booted": bool(info.get("booted")),
             })
         self._json(200, payload, head_only)
 
@@ -1358,12 +1441,13 @@ def prepare_device(quiet=False):
 
 
 def adb_watchdog():
-    """后台保活：adb 连接、注入通道预热、周期性重放低延迟系统设置。"""
+    """后台保活：刷新设备信息缓存、预热注入通道、周期性重放低延迟系统设置。"""
     last_prepare = 0.0
     first_prepare = True
     while True:
         try:
-            if adb_connect():
+            refresh_device_info()
+            if DEVICE_INFO.get("online"):
                 if time.time() - last_prepare > 60:
                     prepare_device(quiet=not first_prepare)
                     first_prepare = False
@@ -1377,7 +1461,7 @@ def adb_watchdog():
                               file=sys.stderr, flush=True)
         except Exception:  # noqa: BLE001
             pass
-        time.sleep(10)
+        time.sleep(3)
 
 
 def main():

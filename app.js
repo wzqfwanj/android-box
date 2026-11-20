@@ -284,9 +284,15 @@
   function toDevice(clientX, clientY) {
     var screenEl = $("#screen");
     var rect = screenEl.getBoundingClientRect();
-    var res = resolution();
+    var res = state.device && state.device.resolution;
+    if (!res || !res.width || !res.height) return null; // 设备信息还没到，别用错误坐标乱点
     var x = Math.round(((clientX - rect.left) / rect.width) * res.width);
     var y = Math.round(((clientY - rect.top) / rect.height) * res.height);
+    state.lastRect = {
+      cx: clientX, cy: clientY, left: rect.left, top: rect.top,
+      width: rect.width, height: rect.height,
+      resW: res.width, resH: res.height,
+    };
     return {
       x: Math.min(Math.max(x, 0), res.width - 1),
       y: Math.min(Math.max(y, 0), res.height - 1),
@@ -304,15 +310,19 @@
   }
 
   function sendTap(clientX, clientY) {
-    showRipple(clientX, clientY);
     var point = toDevice(clientX, clientY);
+    if (!point) return;
+    showRipple(clientX, clientY);
+    state.lastInput = { type: "tap", x: point.x, y: point.y, cx: clientX, cy: clientY };
     postInput({ type: "tap", x: point.x, y: point.y });
   }
 
   function sendSwipe(x1, y1, x2, y2, duration) {
-    showRipple(x1, y1);
     var a = toDevice(x1, y1);
     var b = toDevice(x2, y2);
+    if (!a || !b) return;
+    showRipple(x1, y1);
+    state.lastInput = { type: "swipe", x1: a.x, y1: a.y, x2: b.x, y2: b.y, duration: duration };
     postInput({ type: "swipe", x1: a.x, y1: a.y, x2: b.x, y2: b.y, duration: duration });
   }
 

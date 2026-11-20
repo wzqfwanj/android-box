@@ -223,6 +223,10 @@ PC 睡眠/关机/断网时，Caddy 健康检查（`/api/health`，4s 间隔）�
   方案 B（家用 PC + WHPX 模拟器）：scrcpy 视频流 + WebCodecs 直解，本机浏览器实测 **46~85ms**。
   输入注入始终 **<5ms**（常驻通道），点击还有本地即时涟漪反馈（<20ms）。
   可调参数：`SCRCPY_VIDEO`（1 视频流 / 0 截图轮询）、`CAPTURE_WORKERS`、`JPEG_QUALITY`、`STREAM_W`。
+- **排错**：`/api/state` 读的是后台缓存（每 3 秒刷新），adb 偶发卡住不会拖死接口或点击；
+  设置 `DEBUG=1` 可打开 `/api/debug/stacks` 看线程栈。
+  scrcpy 触摸包必须带**视频坐标系**（编码后的宽高与坐标），尺寸不一致服务端会直接丢弃——
+  代码里已按 `encoded_width/height` 换算，若换了编码分辨率不用改代码。
 - **系统镜像**：AOSP Android 11，**没有 GApps / Google Play 服务**，依赖 Google 服务的应用无法使用。
 - **音频**：只传输画面，**没有声音**。
 - **单设备单实例**：一个 redroid 容器、一个 `ADB_SERIAL`；多人同时打开会看到同一画面并共享操作。
