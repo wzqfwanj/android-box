@@ -43,7 +43,9 @@ android-box/
 | GET | `/` | 页面 |
 | GET | `/cloud/` | 308 跳到 `/`（兼容旧链接，保留 Caddy 前缀） |
 | GET | `/api/health` | 存活探针：`{"ok":true,"mode":"cloud-phone",...}` |
-| GET | `/api/cp/ticket` | 调阿里云换 Ticket；未配置实例 503，凭据/接口错误 502 |
+| GET | `/api/cp/ticket` | 调阿里云换 Ticket；未创建/已释放 503，凭据/接口错误 502 |
+| GET | `/api/cp/power` | 电源状态：`off` / `creating` / `on` / `releasing` / `error`，含进度日志 |
+| POST | `/api/cp/power` | `{"action":"on"}` 开机（创建+装 APK）；`{"action":"off"}` 关机（释放） |
 | GET | `/cp/*`、`/sdk/*` | Web SDK 静态资源（仅 `cp/` 目录内，防目录穿越） |
 
 ## 环境变量
@@ -55,6 +57,7 @@ android-box/
 | `CLOUD_PHONE_INSTANCE` | 空 | 可选：手动指定实例 ID（`acp-...`）；不填则按 `CP_GROUP_NAME` 自动发现当前运行中的实例 |
 | `CP_GROUP_NAME` | 空（工具默认 `android-box-vpc`） | 实例组名：创建/释放后服务自动跟随，无需重启 |
 | `CP_REGION` | `cn-shanghai` | 云手机地域 |
+| `CLOUD_PHONE_APK` | `/var/lib/android-box/meituan.apk` | 「开机」时自动安装的 APK 路径（放网关机上） |
 | `ALIYUN_CONFIG` | `~/.aliyun/config.json` | 阿里云凭据文件（取第一个 profile 的 AK/SK） |
 
 ## 获取 Web SDK（不入库）
@@ -130,10 +133,13 @@ powershell -ExecutionPolicy Bypass -File deploy/deploy.ps1
 python3 -m unittest discover -s tests -v
 ```
 
-## 按需使用：创建 / 释放
+## 按需使用：网页开关机（也支持命令行）
 
-平时保持**释放**状态（实例组 + 网络全删，0 计费）；要用的时候一条命令建回来，
-服务会按 `CP_GROUP_NAME` 自动发现新实例，**不用改配置、不用重启**：
+打开 <https://wkeeli.cn/android/> 直接点 **「开机」**：后端会自动创建网络 + 实例组，
+并把 `CLOUD_PHONE_APK`（默认 `/var/lib/android-box/meituan.apk`）装进云手机，完成后页面自动连上；
+点 **「关机」** 则自动释放实例组和网络（0 计费）。页面会显示进度日志（创建约 2~3 分钟，释放约 30 秒）。
+
+命令行等价操作（服务按 `CP_GROUP_NAME` 自动发现实例，**不用改配置、不用重启**）：
 
 ```bash
 # 创建（首次创建网络约 1~2 分钟）+ 顺手装美团
