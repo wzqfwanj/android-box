@@ -64,8 +64,8 @@ try:
     HAS_PIL = True
 except Exception:  # noqa: BLE001
     HAS_PIL = False
-CAPTURE_WORKERS = max(1, min(4, int(os.environ.get("CAPTURE_WORKERS", "2"))))
-JPEG_QUALITY = max(20, min(95, int(os.environ.get("JPEG_QUALITY", "72"))))
+CAPTURE_WORKERS = max(1, min(4, int(os.environ.get("CAPTURE_WORKERS", "1"))))
+JPEG_QUALITY = max(20, min(95, int(os.environ.get("JPEG_QUALITY", "65"))))
 PIXEL_FORMATS = {1: "RGBA", 2: "RGBX", 3: "RGB", 4: "BGR;16", 5: "BGRA"}
 
 try:
@@ -916,17 +916,36 @@ class Handler(BaseHTTPRequestHandler):
         )
 
 
+def prepare_device():
+    """系统级低延迟设置：关闭窗口/过渡/动画时长。
+
+    Android 的转场动画本身要 300~500ms，关掉后应用切换/弹窗立即到位，
+    配合截图轮询（~200ms/帧）可以把交互反馈压到几百毫秒内。
+    """
+    for key in ("window_animation_scale", "transition_animation_scale", "animator_duration_scale"):
+        adb_shell(["settings", "put", "global", key, "0"], timeout=10)
+    adb_shell(["settings", "put", "system", "screen_off_timeout", "1800000"], timeout=10)
+    print("[android-box] 已关闭系统动画、加长熄屏超时", flush=True)
+
+
 def adb_watchdog():
-    """后台保活：确保 adb 连上 redroid，并预热低延迟注入通道。"""
+    """后台保活：确保 adb 连上 redroid，预热低延迟注入通道，并关闭系统动画。"""
+    prepared = False
     while True:
         try:
-            if adb_connect() and not INJECTOR.ready:
-                # 设备重启/容器重建后 socket 会失效；这里自动重推 jar、重启服务
-                if INJECTOR.ensure():
-                    print("[android-box] scrcpy 注入通道就绪", flush=True)
-                else:
-                    print("[android-box] scrcpy 注入通道未就绪：%s" % INJECTOR.last_error,
-                          file=sys.stderr, flush=True)
+            if adb_connect():
+                if not prepared:
+                    prepare_device()
+                    prepared = True
+                if not INJECTOR.ready:
+                    # 设备重启/容器重建后 socket 会失效；这里自动重推 jar、重启服务
+                    if INJECTOR.ensure():
+                        print("[android-box] scrcpy 注入通道就绪", flush=True)
+                    else:
+                        print("[android-box] scrcpy 注入通道未就绪：%s" % INJECTOR.last_error,
+                              file=sys.stderr, flush=True)
+            else:
+                prepared = False
         except Exception:  # noqa: BLE001
             pass
         time.sleep(10)
