@@ -62,10 +62,25 @@ class HandlerTests(unittest.TestCase):
         self.assertFalse(data["cloud_phone_configured"])
         self.assertIn("no-store", headers.get("Cache-Control", ""))
 
-    def test_ticket_unconfigured(self):
+    def test_ticket_without_credentials(self):
         status, _, body = self.fetch("/api/cp/ticket")
+        self.assertEqual(status, 502)
+        data = json.loads(body)
+        self.assertFalse(data["ok"])
+        self.assertIn("凭据", data["error"])
+
+    def test_ticket_released_is_friendly_503(self):
+        class FakeProc:
+            stdout = json.dumps({"error": "InvalidResourceId.NotFound"}).encode()
+
+        original = app.subprocess.run
+        app.subprocess.run = lambda *a, **kw: FakeProc()
+        try:
+            status, _, body = self.fetch("/api/cp/ticket")
+        finally:
+            app.subprocess.run = original
         self.assertEqual(status, 503)
-        self.assertFalse(json.loads(body)["ok"])
+        self.assertIn("cloudphone.py create", json.loads(body)["error"])
 
     def test_ticket_configured_but_no_credentials(self):
         app.CLOUD_PHONE_INSTANCE = "acp-test"

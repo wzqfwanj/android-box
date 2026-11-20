@@ -20,6 +20,7 @@ HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8150"))
 CLOUD_PHONE_INSTANCE = os.environ.get("CLOUD_PHONE_INSTANCE", "")
 CP_REGION = os.environ.get("CP_REGION", "cn-shanghai")
+CP_GROUP_NAME = os.environ.get("CP_GROUP_NAME", "")
 ALIYUN_CONFIG = os.environ.get("ALIYUN_CONFIG", os.path.expanduser("~/.aliyun/config.json"))
 TICKET_HELPER = os.path.join(BASE_DIR, "tools", "cp_ticket.py")
 START_TIME = time.time()
@@ -142,25 +143,29 @@ class Handler(BaseHTTPRequestHandler):
             "ok": True,
             "service": "android-box",
             "mode": "cloud-phone",
-            "cloud_phone_configured": bool(CLOUD_PHONE_INSTANCE),
+            "cloud_phone_configured": bool(CLOUD_PHONE_INSTANCE or CP_GROUP_NAME),
             "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "uptime": int(time.time() - START_TIME),
         }, head_only)
 
     def _ticket(self, head_only):
-        if not CLOUD_PHONE_INSTANCE:
-            return self._error(503, "未配置云手机实例（CLOUD_PHONE_INSTANCE）", head_only)
         env = dict(os.environ, CP_REGION=CP_REGION, ALIYUN_CONFIG=ALIYUN_CONFIG)
+        if CP_GROUP_NAME:
+            env["CP_GROUP_NAME"] = CP_GROUP_NAME
+        cmd = [sys.executable, TICKET_HELPER]
+        if CLOUD_PHONE_INSTANCE:
+            cmd.append(CLOUD_PHONE_INSTANCE)
         try:
-            proc = subprocess.run(
-                [sys.executable, TICKET_HELPER, CLOUD_PHONE_INSTANCE],
-                capture_output=True, timeout=30, env=env,
-            )
+            proc = subprocess.run(cmd, capture_output=True, timeout=40, env=env)
             data = json.loads(proc.stdout.decode("utf-8", "replace") or "{}")
         except Exception as exc:  # noqa: BLE001
             return self._error(500, "获取 Ticket 失败：%s" % exc, head_only)
         if not data.get("ticket"):
-            return self._error(502, data.get("error") or "没有返回 Ticket", head_only)
+            message = data.get("error") or "没有返回 Ticket"
+            if any(token in message for token in ("未创建", "NotFound", "InvalidResourceId", "不存在")):
+                message = "云手机当前未创建（已释放）。需要用的时候运行：python tools/cloudphone.py create"
+                return self._error(503, message, head_only)
+            return self._error(502, message, head_only)
         data["ok"] = True
         self._json(200, data, head_only)
 
