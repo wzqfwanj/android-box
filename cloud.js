@@ -217,18 +217,23 @@
             var vh = video.videoHeight || 480;
             var angle = opts.rotate === null ? (vw > vh ? 90 : 0) : opts.rotate;
             var swap = angle === 90 || angle === 270;
-            var cw = swap ? vh : vw;
-            var ch = swap ? vw : vh;
+            var rw = swap ? vh : vw;   // 旋转后的画面尺寸
+            var rh = swap ? vw : vh;
+            // 云手机摄像头固定按 720x1280 竖屏出图：按「等比填满 + 居中裁剪」输出，
+            // 避免比例不一致被云手机拉伸导致人脸变形
+            var TW = 720, TH = 1280;
+            var scale = Math.max(TW / rw, TH / rh);
             var canvas = document.createElement("canvas");
-            canvas.width = cw;
-            canvas.height = ch;
+            canvas.width = TW;
+            canvas.height = TH;
             var ctx = canvas.getContext("2d");
             function draw() {
               if (video.readyState >= 2) {
                 ctx.save();
-                ctx.translate(cw / 2, ch / 2);
+                ctx.translate(TW / 2, TH / 2);
                 if (opts.mirror) ctx.scale(-1, 1);
                 ctx.rotate(angle * Math.PI / 180);
+                ctx.scale(scale, scale);
                 ctx.drawImage(video, -vw / 2, -vh / 2, vw, vh);
                 ctx.restore();
               }
