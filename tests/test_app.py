@@ -129,6 +129,34 @@ class HandlerTests(unittest.TestCase):
         status, _, _ = self.fetch("/cp/no-such-file.js")
         self.assertEqual(status, 404)
 
+
+    def test_power_get(self):
+        status, _, body = self.fetch("/api/cp/power")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertIn("state", data)
+
+    def test_power_post_invalid(self):
+        req = urllib.request.Request(self.base + "/api/cp/power", data=b"{}", method="POST",
+                                     headers={"Content-Type": "application/json"})
+        try:
+            urllib.request.urlopen(req, timeout=10)
+            self.fail("应返回 400")
+        except urllib.error.HTTPError as exc:
+            self.assertEqual(exc.code, 400)
+            self.assertFalse(json.loads(exc.read())["ok"])
+
+    def test_power_post_bad_action(self):
+        req = urllib.request.Request(self.base + "/api/cp/power",
+                                     data=b'{"action":"reboot"}', method="POST",
+                                     headers={"Content-Type": "application/json"})
+        try:
+            urllib.request.urlopen(req, timeout=10)
+            self.fail("应返回 400")
+        except urllib.error.HTTPError as exc:
+            self.assertEqual(exc.code, 400)
+
     def test_method_not_allowed(self):
         status, _, _ = self.fetch("/api/health", method="POST")
         self.assertEqual(status, 405)

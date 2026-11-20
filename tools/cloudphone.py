@@ -334,12 +334,31 @@ def status():
                                     inst.get("SystemVersion", "")))
 
 
+def status_json():
+    """机器可读状态：供网站「电源」接口使用。"""
+    site = find_network()
+    group = find_group()
+    instance_id = ""
+    if group:
+        instances = group_instances(group["InstanceGroupId"])
+        running = [i for i in instances if i.get("AndroidInstanceStatus") == "RUNNING"]
+        instance_id = (running or instances or [{}])[0].get("AndroidInstanceId", "")
+    print(json.dumps({
+        "network": site["OfficeSiteId"] if site else "",
+        "networkStatus": site.get("Status", "") if site else "",
+        "groupId": group["InstanceGroupId"] if group else "",
+        "groupStatus": group.get("InstanceGroupStatus", "") if group else "",
+        "instanceId": instance_id,
+    }, ensure_ascii=False))
+
+
 # ---------------------------------------------------------------- CLI
 
 def main():
     parser = argparse.ArgumentParser(description="无影云手机按需管理（创建/释放/状态/装APK）")
     sub = parser.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("status", help="查看网络与实例组状态")
+    p_status = sub.add_parser("status", help="查看网络与实例组状态")
+    p_status.add_argument("--json", action="store_true", help="输出 JSON（供程序调用）")
     p_create = sub.add_parser("create", help="创建网络+实例组（按需）")
     p_create.add_argument("--install-apk", help="创建后安装的 APK 路径（如美团）")
     p_install = sub.add_parser("install-apk", help="给现有实例组安装 APK")
@@ -348,7 +367,7 @@ def main():
     args = parser.parse_args()
 
     if args.cmd == "status":
-        status()
+        status_json() if args.json else status()
     elif args.cmd == "create":
         group = ensure_group()
         if args.install_apk:

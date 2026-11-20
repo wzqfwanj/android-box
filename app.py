@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,6 +24,12 @@ CP_REGION = os.environ.get("CP_REGION", "cn-shanghai")
 CP_GROUP_NAME = os.environ.get("CP_GROUP_NAME", "")
 ALIYUN_CONFIG = os.environ.get("ALIYUN_CONFIG", os.path.expanduser("~/.aliyun/config.json"))
 TICKET_HELPER = os.path.join(BASE_DIR, "tools", "cp_ticket.py")
+CLOUDPHONE_HELPER = os.path.join(BASE_DIR, "tools", "cloudphone.py")
+CLOUD_PHONE_APK = os.environ.get("CLOUD_PHONE_APK", "/var/lib/android-box/meituan.apk")
+
+POWER_LOCK = threading.Lock()
+POWER = {"state": "unknown", "message": "", "instanceId": "", "log": [], "started": 0.0}
+_POWER_PROC = {"proc": None}
 START_TIME = time.time()
 MAX_CP_ASSET = 8 * 1024 * 1024
 
@@ -94,6 +101,9 @@ class Handler(BaseHTTPRequestHandler):
         self._route(head_only=True)
 
     def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/api/cp/power":
+            return self._power_post()
         self._error(405, "不支持的请求方法")
 
     def do_PUT(self):
@@ -107,6 +117,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/health":
             return self._health(head_only)
+        if path == "/api/cp/power":
+            return self._power_get(head_only)
         if path == "/api/cp/ticket":
             return self._ticket(head_only)
         if path in ("/cloud", "/cloud/"):
@@ -135,6 +147,102 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         if not head_only:
             self.wfile.write(body)
+
+
+    # ---- 电源：开机 = 创建（含装 APK），关机 = 释放 ----
+
+    def _read_json(self, limit=65536):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        if length <= 0 or length > limit:
+            return {}
+        try:
+            return json.loads(self.rfile.read(length).decode("utf-8", "replace"))
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def _cloudphone_status(self, require_instance=False):
+        env = dict(os.environ, ALIYUN_CONFIG=ALIYUN_CONFIG, CP_REGION=CP_REGION)
+        if CP_GROUP_NAME:
+            env["CP_GROUP_NAME"] = CP_GROUP_NAME
+        try:
+            proc = subprocess.run([sys.executable, CLOUDPHONE_HELPER, "status", "--json"],
+                                  capture_output=True, timeout=90, env=env)
+            return json.loads(proc.stdout.decode("utf-8", "replace") or "{}")
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def _power_get(self, head_only):
+        with POWER_LOCK:
+            payload = {
+                "ok": True,
+                "state": POWER["state"],
+                "message": POWER["message"],
+                "instanceId": POWER["instanceId"],
+                "log": POWER["log"][-15:],
+            }
+        if payload["state"] in ("unknown",):
+            info = self._cloudphone_status()
+            if info.get("instanceId"):
+                payload["state"] = "on"
+                payload["instanceId"] = info["instanceId"]
+            elif info:
+                payload["state"] = "off"
+        self._json(200, payload, head_only)
+
+    def _power_post(self):
+        body = self._read_json()
+        action = str(body.get("action") or "").strip()
+        if action not in ("on", "off"):
+            return self._error(400, "action 只能是 on / off")
+        with POWER_LOCK:
+            proc = _POWER_PROC["proc"]
+            if proc is not None and proc.poll() is None:
+                return self._error(409, "电源操作进行中，请稍候")
+            initial = "creating" if action == "on" else "releasing"
+            POWER.update(state=initial, message="正在创建云手机…" if action == "on" else "正在释放云手机…",
+                         instanceId="", log=[], started=time.time())
+        threading.Thread(target=self._power_worker, args=(action,), daemon=True).start()
+        self._json(202, {"ok": True, "state": initial})
+
+    def _power_worker(self, action):
+        env = dict(os.environ, ALIYUN_CONFIG=ALIYUN_CONFIG, CP_REGION=CP_REGION)
+        if CP_GROUP_NAME:
+            env["CP_GROUP_NAME"] = CP_GROUP_NAME
+        cmd = [sys.executable, CLOUDPHONE_HELPER, "release"] if action == "off" else [sys.executable, CLOUDPHONE_HELPER, "create"]
+        if action == "on" and os.path.isfile(CLOUD_PHONE_APK):
+            cmd += ["--install-apk", CLOUD_PHONE_APK]
+        state = "error"
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, env=env, bufsize=1)
+            _POWER_PROC["proc"] = proc
+            for line in proc.stdout:
+                line = line.rstrip()
+                if not line:
+                    continue
+                with POWER_LOCK:
+                    POWER["log"] = (POWER["log"] + [line])[-40:]
+                    POWER["message"] = line
+            rc = proc.wait()
+            info = self._cloudphone_status()
+            with POWER_LOCK:
+                if rc == 0:
+                    state = "on" if action == "on" else "off"
+                    POWER["instanceId"] = info.get("instanceId", "") if action == "on" else ""
+                    POWER["message"] = "云手机已开机" if action == "on" else "云手机已释放（0 计费）"
+                else:
+                    state = "error"
+                    POWER["message"] = "操作失败（返回码 %s），见日志" % rc
+                POWER["state"] = state
+        except Exception as exc:  # noqa: BLE001
+            with POWER_LOCK:
+                POWER["state"] = "error"
+                POWER["message"] = "操作异常：%s" % exc
+        finally:
+            _POWER_PROC["proc"] = None
 
     # ---- 接口 ----
 

@@ -145,3 +145,25 @@ main {
 @media (min-width: 720px) {
   .screen { width: 340px; }
 }
+
+/* ---- 电源按钮（开机=创建，关机=释放） ---- */
+.power-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.btn-power {
+  min-width: 92px;
+  font-weight: 600;
+}
+
+.btn[disabled] {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.power-state {
+  color: var(--dim);
+  font-size: 13px;
+}
