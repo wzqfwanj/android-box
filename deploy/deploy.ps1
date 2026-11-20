@@ -92,8 +92,13 @@ try {
     Log "/android/ -> 200"
 
     $ticketCode = (ssh $appHost "curl -sk -o /dev/null -w '%{http_code}' --resolve wkeeli.cn:443:127.0.0.1 '${siteUrl}api/cp/ticket'").Trim()
-    if ($ticketCode -ne "200") { Fail "/android/api/cp/ticket 未返回 200（实际：$ticketCode）" }
-    Log "/android/api/cp/ticket -> 200"
+    if ($ticketCode -eq "503") {
+        Log "/android/api/cp/ticket -> 503（云手机已释放，正常；需要时 python tools/cloudphone.py create）"
+    } elseif ($ticketCode -ne "200") {
+        Fail "/android/api/cp/ticket 异常（实际：$ticketCode）"
+    } else {
+        Log "/android/api/cp/ticket -> 200（云手机运行中）"
+    }
 
     $sdkCode = (ssh $appHost "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8150/cp/WuyingWebSDK.js").Trim()
     if ($sdkCode -ne "200") { Fail "SDK 静态资源缺失（/cp/WuyingWebSDK.js = $sdkCode）：按 README 放好 cp/ 后重发" }

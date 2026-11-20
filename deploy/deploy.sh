@@ -115,8 +115,13 @@ page_code="$(ssh "$APP_HOST" "curl -sk -o /dev/null -w '%{http_code}' $GW_RESOLV
 log "/android/ -> 200"
 
 ticket_code="$(ssh "$APP_HOST" "curl -sk -o /dev/null -w '%{http_code}' $GW_RESOLVE '${SITE_URL}api/cp/ticket'" || true)"
-[ "$ticket_code" = "200" ] || die "/android/api/cp/ticket 未返回 200（实际：${ticket_code:-无响应}）"
-log "/android/api/cp/ticket -> 200"
+if [ "$ticket_code" = "200" ]; then
+  log "/android/api/cp/ticket -> 200（云手机运行中）"
+elif [ "$ticket_code" = "503" ]; then
+  log "/android/api/cp/ticket -> 503（云手机已释放，正常；需要时 python tools/cloudphone.py create）"
+else
+  die "/android/api/cp/ticket 异常（实际：${ticket_code:-无响应}）"
+fi
 
 sdk_code="$(ssh "$APP_HOST" "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8150/cp/WuyingWebSDK.js" || true)"
 [ "$sdk_code" = "200" ] || die "SDK 静态资源缺失（/cp/WuyingWebSDK.js = ${sdk_code:-无响应}）：按 README 放好 cp/ 后重发"
