@@ -168,6 +168,85 @@
       });
   }
 
+
+  // ---- 摄像头方向适配 ----
+  // 浏览器摄像头（尤其手机/WebCam）常见是横向帧，而云手机是固定竖屏，
+  // SDK 不做旋转，直接重定向会让人脸画面歪 90°。这里把浏览器帧转成竖屏再交给 SDK。
+  // 可用 URL 参数手动覆盖：?cam=0|90|180|270（旋转角度）、?mirror=1（左右镜像）。
+  function cameraOptions() {
+    var query = new URLSearchParams(window.location.search);
+    var cam = parseInt(query.get("cam"), 10);
+    return {
+      rotate: isNaN(cam) ? null : ((cam % 360) + 360) % 360,
+      mirror: query.get("mirror") === "1",
+    };
+  }
+
+  function installCameraAdapter() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || window.__camAdapter) return;
+    var opts = cameraOptions();
+    var orig = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+    window.__camAdapter = true;
+    navigator.mediaDevices.getUserMedia = function (constraints) {
+      var c = Object.assign({}, constraints || {});
+      var wantsVideo = false;
+      if (c.video === true) {
+        wantsVideo = true;
+        c.video = {};
+      }
+      if (c.video && typeof c.video === "object") {
+        wantsVideo = true;
+        c.video = Object.assign({}, c.video, {
+          width: { ideal: 720 },
+          height: { ideal: 1280 },
+          aspectRatio: { ideal: 9 / 16 },
+        });
+      }
+      return orig(c).then(function (stream) {
+        if (!wantsVideo) return stream;
+        var track = stream.getVideoTracks()[0];
+        if (!track) return stream;
+        return new Promise(function (resolve) {
+          var video = document.createElement("video");
+          video.muted = true;
+          video.playsInline = true;
+          video.autoplay = true;
+          video.srcObject = stream;
+          video.onloadedmetadata = function () {
+            var vw = video.videoWidth || 640;
+            var vh = video.videoHeight || 480;
+            var angle = opts.rotate === null ? (vw > vh ? 90 : 0) : opts.rotate;
+            var swap = angle === 90 || angle === 270;
+            var cw = swap ? vh : vw;
+            var ch = swap ? vw : vh;
+            var canvas = document.createElement("canvas");
+            canvas.width = cw;
+            canvas.height = ch;
+            var ctx = canvas.getContext("2d");
+            function draw() {
+              if (video.readyState >= 2) {
+                ctx.save();
+                ctx.translate(cw / 2, ch / 2);
+                if (opts.mirror) ctx.scale(-1, 1);
+                ctx.rotate(angle * Math.PI / 180);
+                ctx.drawImage(video, -vw / 2, -vh / 2, vw, vh);
+                ctx.restore();
+              }
+              requestAnimationFrame(draw);
+            }
+            video.play().catch(function () {});
+            draw();
+            var out = canvas.captureStream(30);
+            stream.getAudioTracks().forEach(function (t) { out.addTrack(t); });
+            stream.getVideoTracks().forEach(function (t) { t.stop(); });
+            resolve(out);
+          };
+          video.onerror = function () { resolve(stream); };
+        });
+      });
+    };
+  }
+
   // ---- 画面串流 ----
 
   function sdkReady() {
@@ -370,6 +449,7 @@
     document.addEventListener("keydown", function (event) {
       if (event.key === "Escape" && document.body.classList.contains("is-fullscreen")) exitFullscreen();
     });
+    installCameraAdapter();
     renderPower();
     fetchPower().then(function () {
       if (state.power === "on") connect();
