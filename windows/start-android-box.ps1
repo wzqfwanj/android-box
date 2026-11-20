@@ -72,6 +72,8 @@ if (-not $portBusy) {
   $env:HOST = "127.0.0.1"
   $env:PORT = "8150"
   $env:SCRCPY_VIDEO = "1"
+$env:CLOUD_PHONE_INSTANCE = "acp-3ur525pcli6l70smy"
+$env:CP_REGION = "cn-shanghai"
   $env:JPEG_QUALITY = "68"
   $env:PYTHONUNBUFFERED = "1"
   Start-Process -FilePath "python" -ArgumentList @((Join-Path $AppDir "app.py")) -WorkingDirectory $AppDir -WindowStyle Hidden `

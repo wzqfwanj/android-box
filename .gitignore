@@ -18,3 +18,6 @@ data/
 # 操作系统杂项
 Thumbs.db
 .DS_Store
+
+# 阿里云无影 Web SDK（官方离线包，仅本机使用，不随公开仓库分发）
+cp/

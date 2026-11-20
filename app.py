@@ -64,6 +64,12 @@ SCRCPY_PORT = int(os.environ.get("SCRCPY_PORT", "27183"))
 SCRCPY_VIDEO = os.environ.get("SCRCPY_VIDEO", "1") == "1"
 SCRCPY_VIDEO_BITRATE = int(os.environ.get("SCRCPY_VIDEO_BITRATE", "4000000"))
 
+# ARM 云手机（阿里云无影云手机）：配置实例 ID 后 /cloud/ 页面通过官方 Web SDK 串流。
+# Ticket 由 tools/cp_ticket.py 用本机 ~/.aliyun/config.json 的 AK 获取（不落仓库）。
+CLOUD_PHONE_INSTANCE = os.environ.get("CLOUD_PHONE_INSTANCE", "")
+CP_REGION = os.environ.get("CP_REGION", "cn-shanghai")
+_CP_TICKET_CACHE = {"at": 0.0, "data": None}
+
 # 画面：默认用并行 raw 截图轮询（每帧都是最新截图，延迟稳定 ~200ms）；
 # 没装 Pillow 时自动退回 screenrecord+ffmpeg 的 MJPEG 管线。
 try:
@@ -89,6 +95,20 @@ STATIC_FILES = {
     "/style.css": ("style.css", "text/css; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/favicon.svg": ("favicon.svg", "image/svg+xml"),
+    "/cloud": ("cloud.html", "text/html; charset=utf-8"),
+    "/cloud/": ("cloud.html", "text/html; charset=utf-8"),
+    "/cloud.html": ("cloud.html", "text/html; charset=utf-8"),
+    "/cloud.js": ("cloud.js", "text/javascript; charset=utf-8"),
+}
+
+CP_MIME = {
+    ".js": "text/javascript; charset=utf-8",
+    ".html": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".png": "image/png",
+    ".svg": "image/svg+xml",
+    ".wasm": "application/wasm",
 }
 
 KEY_EVENTS = {
@@ -1189,6 +1209,13 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "android-box/1.0"
     protocol_version = "HTTP/1.1"
 
+    def end_headers(self):
+        # 仅用于本地验证网关 CSP 是否兼容（生产由 Caddy 下发，默认不设置）
+        csp = os.environ.get("CSP_HEADER")
+        if csp:
+            self.send_header("Content-Security-Policy", csp)
+        super().end_headers()
+
     # ---- 基础响应 ----
 
     def _send(self, status, body=b"", content_type="text/plain; charset=utf-8", head_only=False):
@@ -1256,6 +1283,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"packages": third_party_packages()}, head_only)
         if path == "/api/debug/stacks" and os.environ.get("DEBUG") == "1":
             return self._stacks(head_only)
+        if path == "/api/cp/ticket":
+            return self._cp_ticket(head_only)
+        if path.startswith("/cp/"):
+            return self._cp_static(path, head_only)
+        # 无影 Web SDK 按页面相对路径加载 iframe 容器（/cloud/sdk/ASP/container.html）
+        if path.startswith("/cloud/sdk/"):
+            return self._cp_static("/cp/" + path[len("/cloud/"):], head_only)
         static = STATIC_FILES.get(path)
         if static is None:
             return self._error(404, "页面不存在")
@@ -1280,6 +1314,51 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         self._error(405, "不支持的请求方法")
+
+    # ---- 云手机（无影 Web SDK） ----
+
+    def _cp_ticket(self, head_only=False):
+        if not CLOUD_PHONE_INSTANCE:
+            return self._json(503, {"ok": False, "error": "未配置云手机实例"}, head_only)
+        now = time.time()
+        if _CP_TICKET_CACHE["data"] and now - _CP_TICKET_CACHE["at"] < 30:
+            return self._json(200, _CP_TICKET_CACHE["data"], head_only)
+        helper = os.path.join(BASE_DIR, "tools", "cp_ticket.py")
+        try:
+            proc = subprocess.run(
+                [sys.executable, helper, CLOUD_PHONE_INSTANCE],
+                capture_output=True, timeout=30,
+            )
+            data = json.loads(proc.stdout.decode("utf-8", "replace") or "{}")
+        except Exception as exc:  # noqa: BLE001
+            return self._json(500, {"ok": False, "error": "获取 Ticket 失败：%s" % exc}, head_only)
+        if not data.get("ticket"):
+            return self._json(502, {"ok": False, "error": data.get("error") or "没有 Ticket"}, head_only)
+        data["ok"] = True
+        _CP_TICKET_CACHE.update({"at": now, "data": data})
+        return self._json(200, data, head_only)
+
+    def _cp_static(self, path, head_only=False):
+        rel = path[len("/cp/"):]
+        full = os.path.normpath(os.path.join(BASE_DIR, "cp", rel))
+        root = os.path.normpath(os.path.join(BASE_DIR, "cp"))
+        if not full.startswith(root + os.sep):
+            return self._error(404, "页面不存在")
+        if not os.path.isfile(full):
+            return self._error(404, "页面不存在")
+        content_type = CP_MIME.get(os.path.splitext(full)[1].lower(), "application/octet-stream")
+        try:
+            with open(full, "rb") as fh:
+                body = fh.read()
+        except OSError:
+            return self._error(500, "静态文件缺失")
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "public, max-age=3600")
+        self.end_headers()
+        if not head_only:
+            self.wfile.write(body)
 
     # ---- 状态 ----
 

@@ -124,6 +124,34 @@ android-box/
 | `JPEG_QUALITY` | `65` | Pillow 输出 JPEG 质量（越小越省带宽） |
 | `ADB_BIN` | `adb` | adb 可执行文件路径（可选） |
 | `FFMPEG_BIN` | `ffmpeg` | ffmpeg 可执行文件路径（可选） |
+| `CLOUD_PHONE_INSTANCE` | 空 | 阿里云无影云手机实例 ID（`acp-...`）；配置后 `/cloud/` 页面可用，见下文 |
+| `CP_REGION` | `cn-shanghai` | 云手机地域 |
+
+## ARM 云手机（可选，`/cloud/` 页面）
+
+本机模拟器是 x86_64，装不了只有 ARM 库的 APK（例如美团）。可选用阿里云**无影云手机**（Android 12、arm64）：服务端用阿里云 OpenAPI 取连接 Ticket，前端用官方 **Web SDK** 在页面内串流 + 注入触摸，无需 ADB。
+
+1. 阿里云账号里准备好云手机（实例 ID 形如 `acp-xxxx`），本机 `~/.aliyun/config.json` 配好 RAM 用户的 AK（需要 `eds-aic` 相关权限）。
+2. 从 [无影云手机 SDK 下载页](https://help.aliyun.com/zh/ecp/get-cloud-phone-sdk-and-demo) 下载 **Web/H5 SDK**（`WebHtmlSDK.zip`），解压出两个文件放到本目录：
+
+```text
+cp/WuyingWebSDK.js
+cp/sdk/ASP/container.html
+```
+
+> `cp/` 已加入 `.gitignore`：SDK 为阿里云官方离线包（仅授权用户本人/本企业使用），不随公开仓库分发。
+
+3. 启动时配置实例 ID：
+
+```powershell
+$env:CLOUD_PHONE_INSTANCE = "acp-xxxxxxxx"
+$env:CP_REGION = "cn-shanghai"
+python app.py
+```
+
+4. 打开 `/cloud/`（主页也有「ARM 云手机」入口）。后端 `GET /api/cp/ticket` 调 `tools/cp_ticket.py` 取 Ticket，前端 SDK 直连阿里云串流网关。
+
+**计费提醒**：云手机按量约 0.30 元/小时、4 小时起算，关机也计费；不用时请及时释放实例（`DeleteAndroidInstanceGroup`），长期用可考虑包月。
 
 ## 本地运行
 
