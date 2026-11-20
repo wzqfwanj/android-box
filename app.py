@@ -1080,6 +1080,111 @@ HUB = FrameHub()
 # ------------------------------------------------------------------ HTTP
 
 
+def apk_package_name(path):
+    """从 APK 的 AndroidManifest.xml（二进制 AXML）里读 package 属性，不依赖 aapt。"""
+    try:
+        import zipfile
+        with zipfile.ZipFile(path) as zf:
+            data = zf.read("AndroidManifest.xml")
+    except Exception:  # noqa: BLE001
+        return ""
+    try:
+        pos = 8  # 跳过 RES_XML_TYPE 头
+        strings = []
+        while pos + 8 <= len(data):
+            chunk_type, _header_size, chunk_size = struct.unpack_from("<HHI", data, pos)
+            if chunk_size <= 0:
+                break
+            body = pos + 8
+            if chunk_type == 0x0001:  # string pool
+                count = struct.unpack_from("<I", data, body)[0]
+                flags = struct.unpack_from("<I", data, body + 8)[0]
+                strings_start = struct.unpack_from("<I", data, body + 12)[0]
+                offsets = struct.unpack_from("<%dI" % count, data, body + 20)
+                base = pos + strings_start
+                utf8 = bool(flags & 0x100)
+                for off in offsets:
+                    p = base + off
+                    try:
+                        if utf8:
+                            n = data[p]
+                            p += 1
+                            if n & 0x80:
+                                n = ((n & 0x7F) << 8) | data[p]
+                                p += 1
+                            n2 = data[p]
+                            p += 1
+                            if n2 & 0x80:
+                                n2 = ((n2 & 0x7F) << 8) | data[p]
+                                p += 1
+                            strings.append(data[p:p + n2].decode("utf-8", "replace"))
+                        else:
+                            n = struct.unpack_from("<H", data, p)[0]
+                            p += 2
+                            strings.append(data[p:p + n * 2].decode("utf-16-le", "replace"))
+                    except Exception:  # noqa: BLE001
+                        strings.append("")
+            elif chunk_type == 0x0102:  # start element（XML chunk 头 16 字节）
+                elem = pos + _header_size
+                ns_i, name_i = struct.unpack_from("<II", data, elem)
+                name = strings[name_i] if name_i < len(strings) else ""
+                if name == "manifest":
+                    attr_start, _attr_size, attr_count = struct.unpack_from("<HHH", data, elem + 8)
+                    attr_pos = elem + attr_start
+                    for _ in range(attr_count):
+                        _ns, aname_i, _raw = struct.unpack_from("<III", data, attr_pos)
+                        _vsize, _res0, vtype = struct.unpack_from("<HBB", data, attr_pos + 12)
+                        vdata = struct.unpack_from("<I", data, attr_pos + 16)[0]
+                        aname = strings[aname_i] if aname_i < len(strings) else ""
+                        if aname == "package" and vtype == 0x03 and vdata < len(strings):
+                            return strings[vdata]
+                        attr_pos += 20
+                    return ""
+            pos += chunk_size
+    except Exception:  # noqa: BLE001
+        return ""
+    return ""
+
+
+def install_error_hint(detail):
+    """把 adb install 的失败原因翻译成用户能看懂的提示。"""
+    detail = detail or ""
+    if "INSTALL_FAILED_NO_MATCHING_ABIS" in detail:
+        return "这个 APK 只带 ARM 架构的原生库，x86_64 模拟器装不上；请换 universal / x86_64 版本"
+    if "INSTALL_PARSE_FAILED" in detail or "not a valid zip" in detail.lower():
+        return "APK 解析失败（文件损坏或不是标准 APK）"
+    if "INSTALL_FAILED_UPDATE_INCOMPATIBLE" in detail:
+        return "设备上已有签名不同的同包名应用，需要先卸载旧版"
+    if "INSTALL_FAILED_INSUFFICIENT_STORAGE" in detail:
+        return "模拟器存储空间不足"
+    if "INSTALL_FAILED_VERSION_DOWNGRADE" in detail:
+        return "版本号比已安装的低，无法覆盖安装"
+    if "INSTALL_FAILED_INVALID_APK" in detail:
+        return "APK 无效（签名/结构不合法）"
+    return ""
+
+
+def launch_package(package):
+    """启动应用：先解析 launcher activity 用 am start，失败再退回 monkey。"""
+    if not package:
+        return False
+    rc, out, err = adb_shell(["cmd", "package", "resolve-activity", "--brief", package], timeout=15)
+    component = ""
+    for line in (out or "").splitlines():
+        line = line.strip()
+        if "/" in line and not line.startswith("priority") and not line.startswith("No activity"):
+            component = line
+    if component:
+        rc, out, err = adb_shell(["am", "start", "-n", component], timeout=20)
+        text = (out or "") + (err or "")
+        if rc == 0 and "Error" not in text and "Exception" not in text:
+            return True
+    rc, out, err = adb_shell(
+        ["monkey", "-p", package, "-c", "android.intent.category.LAUNCHER", "1"], timeout=20)
+    text = (out or "") + (err or "")
+    return rc == 0 and "No activities found" not in text
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "android-box/1.0"
     protocol_version = "HTTP/1.1"
@@ -1396,6 +1501,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(413, "APK 超过 500MB 上限")
         tmp_path = os.path.join(tempfile.gettempdir(), "upload-%d.apk" % int(time.time() * 1000))
         remaining = length
+        parsed_package = ""
         try:
             with open(tmp_path, "wb") as fh:
                 while remaining > 0:
@@ -1404,7 +1510,10 @@ class Handler(BaseHTTPRequestHandler):
                         raise IOError("上传中断")
                     fh.write(chunk)
                     remaining -= len(chunk)
+            parsed_package = apk_package_name(tmp_path)
+            before = set(third_party_packages())
             rc, out, err = adb(["install", "-r", "-g", tmp_path], timeout=300)
+            after = set(third_party_packages())
         except IOError as exc:
             return self._error(400, "上传失败：%s" % exc)
         finally:
@@ -1412,10 +1521,31 @@ class Handler(BaseHTTPRequestHandler):
                 os.unlink(tmp_path)
             except OSError:
                 pass
+        detail = (out + "\n" + err).strip()
+        print("[android-box] install rc=%d %s" % (rc, detail[:500].replace("\n", " | ")),
+              file=sys.stderr, flush=True)
         ok = rc == 0 and "Success" in out
+        package = ""
+        launched = False
+        if ok:
+            new_packages = sorted(after - before)
+            package = new_packages[0] if new_packages else parsed_package
+            if package:
+                # 确认这个包确实在设备上（重装时用解析出的包名）
+                rc2, out2, _ = adb_shell(["pm", "path", package], timeout=10)
+                if rc2 != 0 or "package:" not in out2:
+                    package = ""
+            if package:
+                launched = launch_package(package)
+                print("[android-box] installed %s launched=%s" % (package, launched),
+                      file=sys.stderr, flush=True)
+        hint = "" if ok else install_error_hint(detail)
         self._json(200 if ok else 502, {
             "ok": ok,
-            "output": (out + "\n" + err).strip()[:2000],
+            "package": package,
+            "launched": launched,
+            "error": hint,
+            "output": detail[:2000],
         })
 
     # ---- 日志 ----

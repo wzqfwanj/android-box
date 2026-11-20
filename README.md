@@ -31,7 +31,7 @@
 | 触摸操作 | 点按 = 设备触摸，拖动 = 滑屏；浏览器坐标按设备分辨率换算后经**常驻注入通道**（scrcpy-server）注入真实系统，实测 ~1~4ms（网关往返 ~30~60ms）；通道异常时自动回退 `adb shell input` |
 | 按键控制 | 返回 / 主屏 / 最近任务 / 音量 − / 音量 + / 电源（常驻注入通道，实测 ~30ms） |
 | 低延迟注入 | 内置 `scrcpy-server v2.4`（Apache-2.0，© Genymobile）常驻设备端，避免每次 `adb shell input` 冷启动 Java 进程（实测 700~800ms → ~30ms） |
-| 上传装 APK | 页面选择 APK 上传（上限 500MB），后端 `adb install -r -g` 安装，页面显示上传进度与安装结果 |
+| 上传装 APK | 页面选择 APK 上传（上限 500MB），后端 `adb install -r -g` 安装；**安装成功后自动启动该应用**并返回包名；失败时给出人话原因（如「只带 ARM 库，x86_64 模拟器装不上」） |
 | 多端观看 | 多个浏览器连接共享同一路 MJPEG 流，服务端只采集一份画面，慢客户端自动丢帧 |
 | 状态与重连 | `/api/state` 轮询显示 adb 在线、Android 是否启动完成、画面模式；画面断开自动重连 |
 | 响应式 | 桌面端居中呈现手机外壳；375px 宽下无横向滚动 |
@@ -94,7 +94,7 @@ android-box/
 | GET | `/api/state` | 设备与画面状态：`adb_online`、`serial`、`model`、`android`、`sdk`、`resolution`、`booted`、`stream`（含 `mode` / `error` / `clients` / `ws_clients` / `ws_sent`） |
 | GET | `/api/apps` | 已安装的第三方应用包名列表 |
 | POST | `/api/input` | 输入注入（JSON），`type` 为 `tap` / `swipe` / `key` / `text` |
-| POST | `/api/install` | 请求体为 APK 二进制（上限 500MB），后端执行 `adb install -r -g` |
+| POST | `/api/install` | 请求体为 APK 二进制（上限 500MB），后端执行 `adb install -r -g`；成功返回 `{ok, package, launched}`（安装后自动启动），失败返回 502 与 `error`（原因翻译）和 `output`（adb 原始输出） |
 
 输入接口请求体示例：
 
@@ -217,8 +217,9 @@ PC 睡眠/关机/断网时，Caddy 健康检查（`/api/health`，4s 间隔）�
 
 ## 限制与边界
 
-- **指令集**：容器是 x86_64 Android。**仅支持 ARM 的 APK 装不上**（`INSTALL_FAILED_NO_MATCHING_ABIS`），
-  需要 x86_64 或包含 x86_64 的 universal APK。
+- **指令集**：模拟器是 x86_64 Android。**只带 ARM 原生库的 APK 装不上**
+  （`INSTALL_FAILED_NO_MATCHING_ABIS`，国内很多 App 的 aarch32/arm64 包都是这种），
+  需要 universal 或包含 x86_64 的 APK；AOSP 模拟器镜像不带 ARM 转译。
 - **性能**：方案 A（2 vCPU / 3.4GB 的 redroid）：截图轮询约 6~8fps，浏览器端「操作→画面变化」实测 ~300~450ms；
   方案 B（家用 PC + WHPX 模拟器）：scrcpy 视频流 + WebCodecs 直解，本机浏览器实测 **46~85ms**。
   输入注入始终 **<5ms**（常驻通道），点击还有本地即时涟漪反馈（<20ms）。

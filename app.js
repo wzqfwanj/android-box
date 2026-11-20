@@ -475,8 +475,10 @@
         data = {};
       }
       if (xhr.status === 200 && data.ok) {
-        toast("APK 安装成功：" + file.name);
-        setStatus("APK 安装成功：" + file.name);
+        var okMsg = "APK 安装成功" + (data.package ? "：" + data.package : "") +
+                    (data.launched ? "（已自动启动）" : "（可在应用抽屉里打开）");
+        toast(okMsg);
+        setStatus(okMsg);
       } else {
         var detail = (data && (data.error || data.output)) || ("HTTP " + xhr.status);
         toast("APK 安装失败：" + String(detail).slice(0, 120));
