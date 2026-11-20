@@ -284,6 +284,74 @@ def cleanup_oss(bucket):
         print("提示：临时 OSS 清理失败（可忽略）：%s" % exc)
 
 
+def run_sync(instance_id, command, wait_ms="3000"):
+    """在云手机里同步执行 shell 命令，返回输出文本。"""
+    data = aic("RunSyncCommand", {"RegionId": REGION, "InstanceIds.1": instance_id,
+                                  "CommandContent": command, "WaitTime": wait_ms})
+    rows = data.get("Data") or [{}]
+    return rows[0].get("Output", "") or ""
+
+
+def wait_network(instance_id, timeout=240):
+    """等云手机真正能上网（新建网络后 NAT/DNS 需要几十秒）。"""
+    deadline = time.time() + timeout
+    probe = "curl -s -m 6 -o /dev/null -w '%{http_code}' https://www.aliyun.com"
+    while time.time() < deadline:
+        try:
+            code = run_sync(instance_id, probe).strip()
+        except RuntimeError:
+            code = ""
+        if code in ("200", "301", "302", "403"):
+            print("云手机网络已就绪（HTTP %s）" % code)
+            return True
+        time.sleep(8)
+    raise RuntimeError("等待云手机网络就绪超时（%ss）" % timeout)
+
+
+def current_instance():
+    group = find_group()
+    if not group:
+        return None
+    for inst in group_instances(group["InstanceGroupId"]):
+        if inst.get("AndroidInstanceStatus") == "RUNNING":
+            return inst["AndroidInstanceId"]
+    return None
+
+
+def launch_app(package_name="com.sankuai.meituan", instance_id=None):
+    """打开应用：monkey 优先，失败再用 resolve-activity + am start；返回前台校验结果。"""
+    instance_id = instance_id or current_instance()
+    if not instance_id:
+        raise RuntimeError("云手机未开机：先 create")
+
+    def foreground():
+        return run_sync(instance_id, "dumpsys activity activities 2>/dev/null | grep -m1 mResumedActivity")
+
+    run_sync(instance_id, "monkey -p %s -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1" % package_name)
+    for _ in range(3):
+        time.sleep(2)
+        out = foreground()
+        if package_name in out:
+            print(out.strip())
+            print("已打开：%s" % package_name)
+            return True
+
+    component = run_sync(
+        instance_id,
+        "cmd package resolve-activity --brief -c android.intent.category.LAUNCHER %s 2>/dev/null | tail -1" % package_name,
+    ).strip()
+    if "/" in component:
+        run_sync(instance_id, "am start -n %s >/dev/null 2>&1" % component)
+        for _ in range(3):
+            time.sleep(2)
+            out = foreground()
+            if package_name in out:
+                print(out.strip())
+                print("已打开：%s" % package_name)
+                return True
+    raise RuntimeError("已尝试打开 %s，但前台不是它；可稍后再试 launch" % package_name)
+
+
 # ---------------------------------------------------------------- 装 APK
 
 def install_apk(group_id, apk_path, package_name="com.sankuai.meituan",
@@ -292,6 +360,7 @@ def install_apk(group_id, apk_path, package_name="com.sankuai.meituan",
     if not instances:
         raise RuntimeError("实例组里没有实例")
     instance_id = instances[0]["AndroidInstanceId"]
+    wait_network(instance_id)
     oss = upload_apk(apk_path)
     try:
         print("创建应用记录 ...")
@@ -309,10 +378,17 @@ def install_apk(group_id, apk_path, package_name="com.sankuai.meituan",
         print("安装到实例 %s（异步）..." % instance_id)
         task = aic("InstallApp", {"AppIdList.1": str(app_id), "InstanceIdList.1": instance_id})
         task_id = task["TaskId"]
-        wait("安装任务完成", lambda: (lambda t: t if t and t.get("TaskStatus") in ("Finished", "Failed") else None)(
+        row = wait("安装任务完成", lambda: (lambda t: t if t and t.get("TaskStatus") in ("Finished", "Failed") else None)(
             (aic("DescribeTasks", {"TaskIds.1": task_id}).get("Data") or [{}])[0]),
             timeout=600, interval=8)
+        if row.get("TaskStatus") != "Finished" or int(row.get("FailedChildCount") or 0) > 0:
+            raise RuntimeError("安装任务失败：%s（成功 %s / 失败 %s）" % (
+                row.get("Param", ""), row.get("SuccessChildCount"), row.get("FailedChildCount")))
+        path = run_sync(instance_id, "pm path %s" % package_name)
+        if "package:" not in path:
+            raise RuntimeError("安装任务显示完成，但设备里没有 %s（可重试 install-apk）" % package_name)
         print("安装完成：%s" % package_name)
+        launch_app(package_name, instance_id)
     finally:
         cleanup_oss(oss["bucket"])
 
@@ -363,6 +439,8 @@ def main():
     p_create.add_argument("--install-apk", help="创建后安装的 APK 路径（如美团）")
     p_install = sub.add_parser("install-apk", help="给现有实例组安装 APK")
     p_install.add_argument("apk", help="APK 文件路径")
+    p_launch = sub.add_parser("launch", help="打开云手机里的应用（默认美团）")
+    p_launch.add_argument("--package", default="com.sankuai.meituan", help="应用包名（默认美团）")
     sub.add_parser("release", help="释放实例组和网络（停止计费）")
     args = parser.parse_args()
 
@@ -379,6 +457,8 @@ def main():
         if not group:
             raise SystemExit("实例组不存在：先运行 create")
         install_apk(group["InstanceGroupId"], args.apk)
+    elif args.cmd == "launch":
+        launch_app(args.package)
     elif args.cmd == "release":
         release()
 

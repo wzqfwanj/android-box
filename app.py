@@ -104,6 +104,8 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         if path == "/api/cp/power":
             return self._power_post()
+        if path == "/api/cp/launch":
+            return self._launch_post()
         self._error(405, "不支持的请求方法")
 
     def do_PUT(self):
@@ -206,6 +208,24 @@ class Handler(BaseHTTPRequestHandler):
                          instanceId="", log=[], started=time.time())
         threading.Thread(target=self._power_worker, args=(action,), daemon=True).start()
         self._json(202, {"ok": True, "state": initial})
+
+    def _launch_post(self):
+        body = self._read_json()
+        package = str(body.get("package") or "com.sankuai.meituan").strip()
+        if not package or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._" for ch in package):
+            return self._error(400, "package 不合法")
+        env = dict(os.environ, ALIYUN_CONFIG=ALIYUN_CONFIG, CP_REGION=CP_REGION)
+        if CP_GROUP_NAME:
+            env["CP_GROUP_NAME"] = CP_GROUP_NAME
+        try:
+            proc = subprocess.run([sys.executable, CLOUDPHONE_HELPER, "launch", "--package", package],
+                                  capture_output=True, timeout=90, env=env)
+            output = (proc.stdout.decode("utf-8", "replace") + proc.stderr.decode("utf-8", "replace")).strip()
+        except Exception as exc:  # noqa: BLE001
+            return self._error(500, "打开应用失败：%s" % exc)
+        if proc.returncode != 0:
+            return self._error(503, output[-500:] or "打开应用失败")
+        self._json(200, {"ok": True, "output": output[-800:]})
 
     def _power_worker(self, action):
         env = dict(os.environ, ALIYUN_CONFIG=ALIYUN_CONFIG, CP_REGION=CP_REGION)

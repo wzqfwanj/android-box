@@ -341,6 +341,25 @@
         connect();
       });
     }
+    var openApp = $("#openApp");
+    if (openApp) {
+      openApp.addEventListener("click", function () {
+        openApp.disabled = true;
+        setStatus("正在打开美团…");
+        api("api/cp/launch", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ package: "com.sankuai.meituan" }),
+        })
+          .then(function (data) {
+            if (data.ok) setStatus("已发送打开请求");
+            else setStatus("打开失败：" + (data.error || "未知错误"));
+          })
+          .catch(function (err) { setStatus("打开失败：" + err.message); })
+          .finally(function () { openApp.disabled = false; });
+      });
+    }
+
     var fullscreen = $("#fullscreen");
     if (fullscreen) fullscreen.addEventListener("click", enterFullscreen);
     var exitBtn = $("#exitFullscreen");
